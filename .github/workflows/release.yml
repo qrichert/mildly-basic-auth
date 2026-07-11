@@ -82,10 +82,14 @@ jobs:
           echo "$body" >> $GITHUB_OUTPUT
           echo 'EOF' >> $GITHUB_OUTPUT
 
-      - name: Download all artifacts
+      # Docker's `build-push-action` also uploads a `.dockerbuild` record.
+      # `download-artifact` cannot extract it, so select only the binary
+      # artifacts prefixed with the repository name.
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
+          pattern: ${{ github.event.repository.name }}-*
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v1
