@@ -10,90 +10,57 @@ _Basic auth with nicer UX._
 > A transparent reverse proxy that shows a password page, sets a secure
 > session cookie, and otherwise gets out of the way.
 
-DROP IN. this is designed around _simplicity_ for people who need quick
-good-enough protection, no headache, no docs to read, nothing new to
-learn this could have been named "very-lazy-auth" too.
-
-designed to be as transparant and low footprint as possible both for DX
-and UX.
-
-idea: it shows a password field, if you enter the password correctly it
-sets a cookie and acts as a full passthrough, something quite simple to
-protect work-in-progress projects and or personal docs.
-
-Basically:
-
-```python
-if not authenticated:
-    redirect_to_password_gate()
-else:
-    passthrough_transparently()  # as if we're not even there...
-```
-
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="demo/dark.png">
   <img alt="Rendered visual of the auth gate." src="demo/light.png">
 </picture>
 
-also double check nothing like that exists. i remember searching and
-found nothing but was always lazey building it. best alternative was
-oauth2 container (quayio or something ? don't remember), it's setup once
-and forget but it's a real big pain to setup for something simple like
-that (google auth etc.), i want a drop-in-and-it-works kinda solution.
-basically basic-auth with a nicer user-experience, basic auth is painful
-and never remembers you credentials
+## What it is
 
-maybe a pun with basic-auth ? like mildly-basic-auth
+`mildly-basic-auth` puts a password page in front of anything that
+speaks HTTP. Enter the password once; it sets a session cookie and turns
+into a transparent passthrough — as if it were never there.
 
-looking into caddy forward auth. on paper looks simple -> if ok send ok,
-if not send html page with password. but where does the logic go? now
-you have to put the logic ? now you need another service for that( which
-we would need too tho), it's a fair match i think, not a straight win
-for caddy here, even tho native. do others work the exact same ?
-nginx/trafik ? in which case it's a +, if caddy is idiosyncratic maybe
-not. i personnally use caddy a lot for most anything, unless i go k3s in
-which case i go traefik
-
-looking into it nforwardauth does almost what i want but looks overly
-complicated, so still quite torn my idea is much more lightweigh in but
-usage and what it does. it's really just a very very transparent
-password wall, a single html page (with css and svg icons embedded) that
-is served or overridden for custome styling
-
-designed to be used with docker. by default runs on `0.0.0.0:8000` with
-a non root `10001` user. debian slim image.
-
-```
-/btw do you recommend alpine or debian here ?
-
-    Debian slim — and it's not close for this project.
-
-    The reasoning, specific to what we're building:
-
-    - musl's allocator is a real problem for a proxy. Alpine means musl
-    libc, and musl's default malloc degrades badly under multi-threaded
-    allocation contention. A reverse proxy allocates per-request across a
-    Tokio thread pool — exactly the workload that hits that cliff. You'd
-    end up bolting on mimalloc/jemalloc to claw the performance back, which
-    is complexity a "mildly basic" tool shouldn't carry.
-    - We don't get Alpine's usual payoff. The stack is rustls (via
-    axum-reverse-proxy's hyper-rustls) + blake3 — both pure Rust, no
-    OpenSSL, no C deps. The classic "Alpine avoids the glibc/OpenSSL mess"
-    win doesn't apply, so you'd take musl's downsides for little upside.
-    - musl's DNS resolver is weaker. It historically mishandles some
-    resolver behaviors (e.g. parallel A/AAAA, larger TCP responses). A
-    proxy that resolves an upstream hostname is precisely where that
-    occasionally bites. glibc just works.
-    - glibc = the default target. No musl cross-compilation setup, no -musl
-    toolchain in CI. Debian slim uses the stock x86_64-unknown-linux-gnu
-    build you're already producing.
-    - The README already commits to it (§58-59: "debian slim image"), so
-    this is consistency, not a new decision.
+```python
+if not authenticated:
+    show_password_gate()
+else:
+    passthrough_transparently()  # as if we're not even there...
 ```
 
-published to Docker Hub as `qrichert/mildly-basic-auth`.
+It fills the awkward middle ground: HTTP Basic auth is too ugly (a
+native browser dialog that never remembers you), and a full OAuth2 proxy
+is far too much (Google sign-in, callback URLs, client secrets) just to
+keep strangers out of a work-in-progress project or some personal docs.
 
-drop-in usage (this is v0, works today):
+## Philosophy: stupid simple
+
+One environment variable for the password, one for the upstream. No
+config file to learn, no docs to read, no accounts, no database, no
+Redis. Drop the container in front of your app and it works.
+
+Everything else follows from that:
+
+- The login page is a single self-contained HTML file (inline CSS and
+  SVG, no external requests — the wall never phones home).
+- Sessions are stateless. The cookie is a digest of the password, so
+  there is nothing to persist, and rotating the password invalidates
+  every session for free.
+- Authenticated traffic passes through untouched, streaming and
+  WebSockets included.
+
+## Cookbook
+
+Images are published to Docker Hub as [`qrichert/mildly-basic-auth`].
+
+[`qrichert/mildly-basic-auth`]:
+  https://hub.docker.com/r/qrichert/mildly-basic-auth
+
+### Drop-in
+
+The whole thing is two environment variables. Point `MBA_UPSTREAM` at
+the service you want to protect and publish the gate's port instead of
+the app's:
 
 ```yml
 services:
@@ -102,7 +69,7 @@ services:
     ports:
       - "80:8000"
     environment:
-      MBA_PASSWORD: "h3lloW0rld"
+      MBA_PASSWORD: "Tr0ub4dor&3"
       MBA_UPSTREAM: http://app:2001
   app:
     image: traefik/whoami
@@ -110,53 +77,99 @@ services:
       - "--port=2001"
 ```
 
-use a long random `MBA_PASSWORD`, not something guessable like the
-`h3lloW0rld` above — the session cookie is a fast digest of it, so a
-leaked cookie is an offline verifier of the password.
+Use a long, random `MBA_PASSWORD`, not something guessable like the
+`Tr0ub4dor&3` above. The session cookie is a fast digest of the
+password, so a leaked cookie is an offline verifier of it — a strong
+secret stays safe, a weak one does not.
 
-v0 sets a non-`Secure` cookie, so over plain HTTP (like the `80:8000`
-above) the password and session token are visible on the wire. for
-public deployments put it behind Caddy/Traefik for TLS; direct HTTP is
-fine only on a trusted network.
+### Behind Caddy (TLS)
 
-v1 idea:
+The drop-in above serves plain HTTP, so the session cookie is not
+`Secure` and both the password and the token are visible on the wire.
+That is fine on a trusted network, but for anything public, terminate
+TLS in front. Caddy sets `X-Forwarded-Proto: https`, which flips the
+cookie's `Secure` flag on automatically:
 
-- different auth methods:
-  - plain password only (most convenient, actually enough for many use
-    cases)
-  - hashed password (`<algo>:<hash>`)
-  - list of user/pass possible
-  - bearer token (header-only check, maybe, not in v1 tho)
-- support env vars, env file, yaml config file (set `MBA_CONFIG_FILE` or
-  discovered).
-- custom template (set `MBA_TEMPLATE_FILE` or discovered bind mount to
-  `/etc/template.html`). loaded/rendered at startup. likely will need a
-  template engine to interpolate variables and conditionally render
-  fields based on auth method (username + password or password alone, in
-  that case minijinja looks good).
-- rate-limiting/host whitelist/etc. should probably be handled with a
-  reverse proxy like Caddy etc. in front. not our job probably.
-- of course the proxy part is not homemade, use a proper dependency
-- settings:
-  - auth method
-  - host/port bind
-  - log stuff or not
-  - template
-  - session lifetime
-  - page:
-    - lang
-    - title
-    - placeholder
-    - etc., enabling translation without a custom template
-- non goals:
-  - ldap
-  - oauth
-  - admin panel
-  - policy rules
-  - redis
-  - MFA/TOTP
-  - sso
-  - etc.
+```yml
+services:
+  caddy:
+    image: caddy:2
+    ports:
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+  auth-gate:
+    image: qrichert/mildly-basic-auth:latest
+    environment:
+      MBA_PASSWORD: ${MBA_PASSWORD:?set a strong password}
+      MBA_UPSTREAM: http://app:2001
+  app:
+    image: traefik/whoami
+    command:
+      - "--port=2001"
+```
 
-  look at password wall in ../hoplageiss the goal is to rip that one out
-  of the project and replace it with this "middleware" container.
+```caddyfile
+# Caddyfile
+docs.example.com {
+    reverse_proxy auth-gate:8000
+}
+```
+
+### Without Docker
+
+It is a single static binary. Install it from [crates.io] and hand it
+the same two variables (it binds `0.0.0.0:8000`):
+
+```console
+$ cargo install mildly-basic-auth
+$ MBA_PASSWORD='…' MBA_UPSTREAM='http://127.0.0.1:2001' mildly-basic-auth
+```
+
+[crates.io]: https://crates.io/crates/mildly-basic-auth
+
+## Configuration
+
+| Variable       | Required | Description                                     |
+| -------------- | -------- | ----------------------------------------------- |
+| `MBA_PASSWORD` | yes      | The password. Startup fails if unset or empty.  |
+| `MBA_UPSTREAM` | yes      | Absolute `http(s)://host[:port]` to forward to. |
+
+A missing or empty variable is a hard startup error, not a silent
+passthrough — the point is protection, so a misconfiguration fails loud
+instead of leaving the door open.
+
+The container listens on `0.0.0.0:8000` and runs as a non-root user (UID
+`10001`) on a Debian-slim image.[^debian]
+
+[^debian]:
+    Debian slim, not Alpine: musl's allocator degrades under the
+    per-request, multithreaded allocation a proxy does, and the
+    pure-Rust TLS stack (rustls + blake3, no OpenSSL) means Alpine's
+    usual glibc/OpenSSL payoff does not apply here.
+
+## Roadmap
+
+v0 is plain-password-in-an-env-var with a fixed template. Planned next:
+
+- **More auth methods:** hashed password (`<algo>:<hash>`), multiple
+  user/password pairs, and possibly a header-only bearer-token check.
+- **Config beyond env vars:** an env file or a YAML config file (via
+  `MBA_CONFIG_FILE` or discovery).
+- **Custom template:** full override via `MBA_TEMPLATE_FILE` or a bind
+  mount to `/etc/template.html`, loaded at startup, with a template
+  engine to interpolate variables and conditionally render fields per
+  auth method.
+- **Page customization** without a custom template: language, title,
+  placeholder — enough to translate the page.
+- **More settings:** auth method, bind host/port, logging on/off,
+  session lifetime.
+- **Authentication hardening:** optional failed-login throttling, once
+  trusted client-IP handling is configurable.
+
+### Non-goals
+
+General traffic controls such as rate limiting and host allow-listing
+belong at the edge, not here. Also deliberately out of scope,
+permanently: LDAP, OAuth, an admin panel, policy rules, Redis, MFA/TOTP,
+and SSO.
