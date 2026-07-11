@@ -11,8 +11,8 @@ _Basic auth with nicer UX._
 > session cookie, and otherwise gets out of the way.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="demo/dark.png">
-  <img alt="Rendered visual of the auth gate." src="demo/light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="./demo/dark.png">
+  <img alt="Rendered visual of the auth gate." src="./demo/light.png">
 </picture>
 
 ## What it is
@@ -101,6 +101,7 @@ services:
   auth-gate:
     image: qrichert/mildly-basic-auth:latest
     environment:
+      MBA_ADDRESS: 0.0.0.0:4630
       MBA_PASSWORD: ${MBA_PASSWORD:?set a strong password}
       MBA_UPSTREAM: http://app:2001
   app:
@@ -112,14 +113,14 @@ services:
 ```caddyfile
 # Caddyfile
 docs.example.com {
-    reverse_proxy auth-gate:8000
+    reverse_proxy auth-gate:4630
 }
 ```
 
 ### Without Docker
 
 It is a single static binary. Install it from [crates.io] and hand it
-the same two variables (it binds `0.0.0.0:8000`):
+the same two variables (it binds `0.0.0.0:8000` by default):
 
 ```console
 $ cargo install mildly-basic-auth
@@ -130,17 +131,21 @@ $ MBA_PASSWORD='…' MBA_UPSTREAM='http://127.0.0.1:2001' mildly-basic-auth
 
 ## Configuration
 
-| Variable       | Required | Description                                     |
-| -------------- | -------- | ----------------------------------------------- |
-| `MBA_PASSWORD` | yes      | The password. Startup fails if unset or empty.  |
-| `MBA_UPSTREAM` | yes      | Absolute `http(s)://host[:port]` to forward to. |
+| Variable       | Required | Description                                      |
+| -------------- | -------- | ------------------------------------------------ |
+| `MBA_ADDRESS`  | no       | IP and port to bind. Defaults to `0.0.0.0:8000`. |
+| `MBA_PASSWORD` | yes      | The password. Startup fails if unset or empty.   |
+| `MBA_UPSTREAM` | yes      | Absolute `http(s)://host[:port]` to forward to.  |
 
-A missing or empty variable is a hard startup error, not a silent
-passthrough — the point is protection, so a misconfiguration fails loud
-instead of leaving the door open.
+`MBA_ADDRESS` accepts a concrete IPv4 or bracketed IPv6 address, not a
+hostname, and the port must not be zero.
 
-The container listens on `0.0.0.0:8000` and runs as a non-root user (UID
-`10001`) on a Debian-slim image.[^debian]
+A missing or empty required variable or an invalid `MBA_ADDRESS` is a
+hard startup error, not a silent passthrough — the point is protection,
+so a misconfiguration fails loud instead of leaving the door open.
+
+The container listens on `0.0.0.0:8000` by default and runs as a
+non-root user (UID `10001`) on a Debian-slim image.[^debian]
 
 [^debian]:
     Debian slim, not Alpine: musl's allocator degrades under the
@@ -162,8 +167,7 @@ v0 is plain-password-in-an-env-var with a fixed template. Planned next:
   auth method.
 - **Page customization** without a custom template: language, title,
   placeholder — enough to translate the page.
-- **More settings:** auth method, bind host/port, logging on/off,
-  session lifetime.
+- **More settings:** auth method, logging on/off, session lifetime.
 - **Authentication hardening:** optional failed-login throttling, once
   trusted client-IP handling is configurable.
 

@@ -5,10 +5,15 @@
 
 use std::error::Error;
 use std::fmt;
+use std::net::SocketAddr;
 
 use axum::http::Uri;
 use blake3::Hash;
 
+/// Default IP socket address the service listens on.
+const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8000";
+/// Environment variable holding the IP socket address to listen on.
+const ENV_ADDRESS: &str = "MBA_ADDRESS";
 /// Environment variable holding the plain password (required, non-empty).
 const ENV_PASSWORD: &str = "MBA_PASSWORD";
 /// Environment variable holding the upstream URL (required, absolute
@@ -19,9 +24,11 @@ const ENV_UPSTREAM: &str = "MBA_UPSTREAM";
 ///
 /// Cloned per request by the gate middleware (`from_fn_with_state`
 /// requires the state to be `Clone`), which is why fields are cheap to
-/// copy/clone (`Hash` is `Copy`, `String` is `Clone`).
+/// copy/clone (`Hash` and `SocketAddr` are `Copy`, `String` is `Clone`).
 #[derive(Clone)]
 pub struct Config {
+    /// Validated IP socket address the service listens on.
+    bind_address: SocketAddr,
     /// BLAKE3 digest of the configured password. The session cookie
     /// carries this same value as hex; a request authenticates by
     /// presenting a cookie that matches it. Storing the digest (not the
@@ -36,19 +43,29 @@ pub struct Config {
 }
 
 impl Config {
-    /// Build from the process environment. Thin wrapper over
-    /// [`Config::from_values`]; kept separate so the validation logic
-    /// stays testable without mutating process-wide env (which is
-    /// `unsafe` in Rust 2024).
+    /// Build from the process environment. Delegates to the same pure
+    /// validation as [`Config::from_values`] so tests do not have to mutate
+    /// process-wide env (which is `unsafe` in Rust 2024).
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] if `MBA_PASSWORD` is empty or `MBA_UPSTREAM`
-    /// is not a valid absolute HTTP(S) URL.
+    /// Returns [`ConfigError`] if `MBA_ADDRESS` is not a valid non-zero IP
+    /// socket address, `MBA_PASSWORD` is empty, or `MBA_UPSTREAM` is not a
+    /// valid absolute HTTP(S) URL.
     pub fn from_env() -> Result<Self, ConfigError> {
+        let address = match std::env::var(ENV_ADDRESS) {
+            Ok(address) => address,
+            Err(std::env::VarError::NotPresent) => DEFAULT_BIND_ADDRESS.to_string(),
+            Err(std::env::VarError::NotUnicode(address)) => {
+                return Err(ConfigError::InvalidAddress {
+                    value: address.to_string_lossy().into_owned(),
+                    reason: "not valid Unicode",
+                });
+            }
+        };
         let password = std::env::var(ENV_PASSWORD).unwrap_or_default();
         let upstream = std::env::var(ENV_UPSTREAM).unwrap_or_default();
-        Self::from_values(&password, &upstream)
+        Self::from_values_and_address(&password, &upstream, &address)
     }
 
     /// Build and validate from explicit values (pure, env-free).
@@ -66,13 +83,31 @@ impl Config {
     ///
     /// Returns [`ConfigError::MissingPassword`] for an empty password, or
     /// [`ConfigError::MissingUpstream`] / [`ConfigError::InvalidUpstream`]
-    /// if the upstream is not a valid absolute HTTP(S) URL.
+    /// if the upstream is not a valid absolute HTTP(S) URL. The bind
+    /// address uses the default `0.0.0.0:8000`.
     pub fn from_values(password: &str, upstream: &str) -> Result<Self, ConfigError> {
+        Self::from_values_and_address(password, upstream, DEFAULT_BIND_ADDRESS)
+    }
+
+    /// Validated IP socket address the service listens on.
+    #[must_use]
+    pub fn bind_address(&self) -> SocketAddr {
+        self.bind_address
+    }
+
+    /// Build and validate the complete runtime configuration.
+    fn from_values_and_address(
+        password: &str,
+        upstream: &str,
+        address: &str,
+    ) -> Result<Self, ConfigError> {
         if password.is_empty() {
             return Err(ConfigError::MissingPassword);
         }
         let upstream = validate_upstream(upstream)?;
+        let address = validate_address(address)?;
         Ok(Self {
+            bind_address: address,
             session: blake3::hash(password.as_bytes()),
             upstream,
         })
@@ -94,10 +129,36 @@ impl fmt::Debug for Config {
         // Never print the session digest: it is a password-equivalent
         // bearer token, so an accidental log must not leak it.
         f.debug_struct("Config")
+            .field("bind_address", &self.bind_address)
             .field("session", &"<redacted>")
             .field("upstream", &self.upstream)
             .finish()
     }
+}
+
+/// Validate `address` as a non-zero IP socket address.
+///
+/// # Examples
+///
+/// ```ignore
+/// assert!(validate_address("0.0.0.0:4630").is_ok());
+/// assert!(validate_address("[::]:4630").is_ok());
+/// assert!(validate_address("localhost:4630").is_err()); // Not an IP.
+/// assert!(validate_address("0.0.0.0:0").is_err()); // Zero port.
+/// ```
+fn validate_address(address: &str) -> Result<SocketAddr, ConfigError> {
+    let address = address.trim();
+    let invalid = |reason: &'static str| ConfigError::InvalidAddress {
+        value: address.to_string(),
+        reason,
+    };
+    let address: SocketAddr = address
+        .parse()
+        .map_err(|_| invalid("expected an IP address and port"))?;
+    if address.port() == 0 {
+        return Err(invalid("port must not be zero"));
+    }
+    Ok(address)
 }
 
 /// Validate `upstream` as an absolute `http(s)://host[:port]` URL.
@@ -171,6 +232,8 @@ fn validate_upstream(upstream: &str) -> Result<String, ConfigError> {
 /// misconfiguration fails fast with an actionable message.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConfigError {
+    /// `MBA_ADDRESS` was not a valid non-zero IP socket address.
+    InvalidAddress { value: String, reason: &'static str },
     /// `MBA_PASSWORD` was unset or empty.
     MissingPassword,
     /// `MBA_UPSTREAM` was unset or empty.
@@ -182,6 +245,10 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidAddress { value, reason } => write!(
+                f,
+                "`{ENV_ADDRESS}` is not a valid IP socket address ({reason}): {value:?}"
+            ),
             Self::MissingPassword => {
                 write!(f, "`{ENV_PASSWORD}` must be set to a non-empty value")
             }
@@ -206,6 +273,83 @@ mod tests {
     #[test]
     fn valid_values_build_a_config() {
         assert!(Config::from_values("hunter2", "http://app:2001").is_ok());
+    }
+
+    #[test]
+    fn values_use_the_default_address() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        assert_eq!(config.bind_address(), "0.0.0.0:8000".parse().unwrap());
+    }
+
+    #[test]
+    fn custom_ipv4_address_is_accepted() {
+        let config =
+            Config::from_values_and_address("hunter2", "http://app:2001", "127.0.0.1:4630")
+                .unwrap();
+        assert_eq!(config.bind_address(), "127.0.0.1:4630".parse().unwrap());
+    }
+
+    #[test]
+    fn custom_ipv6_address_is_accepted() {
+        let config =
+            Config::from_values_and_address("hunter2", "http://app:2001", "[::1]:4630").unwrap();
+        assert_eq!(config.bind_address(), "[::1]:4630".parse().unwrap());
+    }
+
+    #[test]
+    fn surrounding_whitespace_in_address_is_trimmed() {
+        let config =
+            Config::from_values_and_address("hunter2", "http://app:2001", "  127.0.0.1:4630  ")
+                .unwrap();
+        assert_eq!(config.bind_address(), "127.0.0.1:4630".parse().unwrap());
+    }
+
+    #[test]
+    fn empty_address_is_rejected() {
+        assert_matches!(
+            Config::from_values_and_address("hunter2", "http://app:2001", ""),
+            Err(ConfigError::InvalidAddress { .. })
+        );
+    }
+
+    #[test]
+    fn hostname_address_is_rejected() {
+        assert_matches!(
+            Config::from_values_and_address("hunter2", "http://app:2001", "localhost:4630"),
+            Err(ConfigError::InvalidAddress { .. })
+        );
+    }
+
+    #[test]
+    fn address_without_port_is_rejected() {
+        assert_matches!(
+            Config::from_values_and_address("hunter2", "http://app:2001", "127.0.0.1"),
+            Err(ConfigError::InvalidAddress { .. })
+        );
+    }
+
+    #[test]
+    fn address_with_non_numeric_port_is_rejected() {
+        assert_matches!(
+            Config::from_values_and_address("hunter2", "http://app:2001", "127.0.0.1:abc"),
+            Err(ConfigError::InvalidAddress { .. })
+        );
+    }
+
+    #[test]
+    fn address_with_out_of_range_port_is_rejected() {
+        assert_matches!(
+            Config::from_values_and_address("hunter2", "http://app:2001", "127.0.0.1:99999"),
+            Err(ConfigError::InvalidAddress { .. })
+        );
+    }
+
+    #[test]
+    fn address_with_zero_port_is_rejected() {
+        assert_matches!(
+            Config::from_values_and_address("hunter2", "http://app:2001", "127.0.0.1:0"),
+            Err(ConfigError::InvalidAddress { .. })
+        );
     }
 
     #[test]

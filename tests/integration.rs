@@ -407,6 +407,7 @@ async fn raw_request(authority: &str, request: &str) -> String {
 #[test]
 fn missing_password_fails_fast() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_mildly-basic-auth"))
+        .env_remove("MBA_ADDRESS")
         .env_remove("MBA_PASSWORD")
         .env("MBA_UPSTREAM", "http://127.0.0.1:9")
         .output()
@@ -420,6 +421,7 @@ fn missing_password_fails_fast() {
 #[test]
 fn missing_upstream_fails_fast() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_mildly-basic-auth"))
+        .env_remove("MBA_ADDRESS")
         .env("MBA_PASSWORD", PASSWORD)
         .env_remove("MBA_UPSTREAM")
         .output()
@@ -428,4 +430,101 @@ fn missing_upstream_fails_fast() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("MBA_UPSTREAM"), "stderr: {stderr}");
+}
+
+#[test]
+fn invalid_address_fails_fast() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mildly-basic-auth"))
+        .env("MBA_ADDRESS", "localhost:4630")
+        .env("MBA_PASSWORD", PASSWORD)
+        .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("MBA_ADDRESS"), "stderr: {stderr}");
+}
+
+#[test]
+fn custom_address_is_bound() {
+    let password = format!("custom-address-test-{}", std::process::id());
+    let mut failures = Vec::new();
+
+    // Passing an inherited listener would require a production API solely
+    // for this test. Retry the complete attempt if another process wins the
+    // allocation-to-bind gap, and authenticate with a per-process password
+    // so another listener cannot produce a false positive.
+    for _ in 0..5 {
+        let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = available.local_addr().unwrap();
+        drop(available);
+
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mildly-basic-auth"))
+            .env("MBA_ADDRESS", address.to_string())
+            .env("MBA_PASSWORD", &password)
+            .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut is_serving = false;
+        while std::time::Instant::now() < deadline {
+            if authenticates_at(address, &password) {
+                is_serving = true;
+                break;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        if is_serving {
+            return;
+        }
+        failures.push(format!(
+            "`{address}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    panic!(
+        "service did not bind after five attempts:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Submit `password` and verify the listener is this test's service.
+fn authenticates_at(address: std::net::SocketAddr, password: &str) -> bool {
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(50))
+    else {
+        return false;
+    };
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+        .unwrap();
+
+    let body = format!("password={password}");
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {address}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    if std::io::Write::write_all(&mut stream, request.as_bytes()).is_err() {
+        return false;
+    }
+
+    let mut response = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut stream, &mut response);
+    let response = String::from_utf8_lossy(&response);
+    let token = blake3::hash(password.as_bytes()).to_hex();
+    response.starts_with("HTTP/1.1 303 See Other")
+        && response.contains(&format!("set-cookie: mba={token}"))
 }

@@ -12,9 +12,6 @@ use std::process::ExitCode;
 
 use mildly_basic_auth::{Config, build_app};
 
-/// Fixed bind address (v0 has no config).
-const BIND_ADDRESS: &str = "0.0.0.0:8000";
-
 #[tokio::main]
 async fn main() -> ExitCode {
     let config = match Config::from_env() {
@@ -25,10 +22,11 @@ async fn main() -> ExitCode {
         }
     };
 
-    let listener = match tokio::net::TcpListener::bind(BIND_ADDRESS).await {
+    let address = config.bind_address();
+    let listener = match tokio::net::TcpListener::bind(address).await {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("error: cannot bind `{BIND_ADDRESS}`: {error}");
+            eprintln!("error: cannot bind `{address}`: {error}");
             return ExitCode::FAILURE;
         }
     };
