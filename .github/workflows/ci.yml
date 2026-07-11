@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [lint, test, coverage-pct, doc]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Set up Just
+        uses: taiki-e/install-action@just
+
+      - name: Cache cargo registry and build
+        if: matrix.target != 'coverage-pct'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key:
+            ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Install Tarpaulin
+        if: matrix.target == 'coverage-pct'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Cache prek
+        if: matrix.target == 'lint'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/prek/
+          key:
+            ${{ runner.os }}-prek-${{ hashFiles('**/.pre-commit-config.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-prek-
+
+      - name: Install prek
+        if: matrix.target == 'lint'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: prek
+
+      - name: Run Justfile target
+        run: just ${{ matrix.target }}
