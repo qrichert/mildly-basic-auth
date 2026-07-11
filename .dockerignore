@@ -1,0 +1,10 @@
+# Whitelist principle: ignore everything, then re-include only what the
+# build needs. The template (`src/index.html`) is embedded via
+# `include_str!`, so it comes in with `src/` — no separate entry needed.
+*
+!/Cargo.toml
+!/Cargo.lock
+!/src/
+
+# Re-exclude nested cruft the whitelist would otherwise pull back in.
+**/.DS_Store

@@ -97,3 +97,31 @@ jobs:
             artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Independent of the binary release. Needs the `DOCKERHUB_USERNAME` and
+  # `DOCKERHUB_TOKEN` repository secrets. Docker Hub auth is via those
+  # secrets, so no `packages:` scope is required.
+  docker:
+    name: Publish Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            qrichert/mildly-basic-auth:${{ github.ref_name }}
+            qrichert/mildly-basic-auth:latest

@@ -30,6 +30,11 @@ else:
     passthrough_transparently()  # as if we're not even there...
 ```
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="demo/dark.png">
+  <img alt="Rendered visual of the auth gate." src="demo/light.png">
+</picture>
+
 also double check nothing like that exists. i remember searching and
 found nothing but was always lazey building it. best alternative was
 oauth2 container (quayio or something ? don't remember), it's setup once
@@ -86,9 +91,9 @@ a non root `10001` user. debian slim image.
     this is consistency, not a new decision.
 ```
 
-probably ghcr.io unless it's very simple to publish to dockerhub.
+published to Docker Hub as `qrichert/mildly-basic-auth`.
 
-v1 idea:
+drop-in usage (this is v0, works today):
 
 ```yml
 services:
@@ -104,6 +109,17 @@ services:
     command:
       - "--port=2001"
 ```
+
+use a long random `MBA_PASSWORD`, not something guessable like the
+`h3lloW0rld` above — the session cookie is a fast digest of it, so a
+leaked cookie is an offline verifier of the password.
+
+v0 sets a non-`Secure` cookie, so over plain HTTP (like the `80:8000`
+above) the password and session token are visible on the wire. for
+public deployments put it behind Caddy/Traefik for TLS; direct HTTP is
+fine only on a trusted network.
+
+v1 idea:
 
 - different auth methods:
   - plain password only (most convenient, actually enough for many use

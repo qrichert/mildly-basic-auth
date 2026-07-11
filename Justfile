@@ -17,6 +17,10 @@ alias b := build
 build:
     cargo build --release --all-features
 
+# Build the Docker image
+docker-build:
+    docker build --tag mildly-basic-auth:latest .
+
 alias l := lint
 # Run various linting tools
 lint:
@@ -35,7 +39,7 @@ check:
 alias t := test
 # Run unit tests
 test *args:
-    cargo test --all-features -- --test-threads 1 {{ args }}
+    cargo test --all-features -- {{ args }}
 
 # Build documentation
 doc:
@@ -51,7 +55,7 @@ coverage:
 alias cpc := coverage-pct
 # Ensure code coverage minimum %
 coverage-pct:
-    cargo tarpaulin --engine Llvm --timeout 120 --out Stdout --all-features --fail-under 75
+    cargo tarpaulin --engine Llvm --timeout 120 --out Stdout --all-features --fail-under 90
 
 # Install `mildly-basic-auth`
 install:
