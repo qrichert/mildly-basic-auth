@@ -129,3 +129,12 @@ jobs:
           tags: |
             qrichert/mildly-basic-auth:${{ github.ref_name }}
             qrichert/mildly-basic-auth:latest
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: qrichert/mildly-basic-auth
+          readme-filepath: ./README.md
+          short-description: Basic auth with nicer UX.

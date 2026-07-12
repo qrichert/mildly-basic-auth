@@ -11,8 +11,8 @@ _Basic auth with nicer UX._
 > session cookie, and otherwise gets out of the way.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./demo/dark.png">
-  <img alt="Rendered visual of the auth gate." src="./demo/light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/qrichert/mildly-basic-auth/main/demo/dark.png">
+  <img alt="Rendered visual of the auth gate." src="https://raw.githubusercontent.com/qrichert/mildly-basic-auth/main/demo/light.png">
 </picture>
 
 ## What it is
@@ -173,7 +173,7 @@ $ MBA_PASSWORD='…' MBA_UPSTREAM='http://127.0.0.1:2001' mildly-basic-auth
 | Variable             | Required | Description                                           |
 | -------------------- | -------- | ----------------------------------------------------- |
 | `MBA_ADDRESS`        | no       | IP and port to bind. Defaults to `0.0.0.0:8000`.      |
-| `MBA_PASSWORD_<tag>` | no       | An additional password; `<tag>` is a free-form label. |
+| `MBA_PASSWORD_<tag>` | no\*     | An additional password; `<tag>` is a free-form label. |
 
 \* At least one password must be set — `MBA_PASSWORD` or any
 `MBA_PASSWORD_<tag>`; there is no privileged base variable. Passwords
