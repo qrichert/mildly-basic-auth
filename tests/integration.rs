@@ -91,13 +91,18 @@ struct Harness {
 
 /// Spin an upstream and a gate on ephemeral ports.
 async fn spawn() -> Harness {
+    spawn_with_passwords(&[PASSWORD]).await
+}
+
+/// Spin an upstream and a gate configured with the given passwords.
+async fn spawn_with_passwords(passwords: &[&str]) -> Harness {
     let upstream = Arc::new(Upstream::default());
     let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let up_addr = up_listener.local_addr().unwrap();
     let up_app = Router::new().fallback(record).with_state(upstream.clone());
     tokio::spawn(async move { axum::serve(up_listener, up_app).await.unwrap() });
 
-    let config = Config::from_values(PASSWORD, &format!("http://{up_addr}")).unwrap();
+    let config = Config::from_passwords(passwords, &format!("http://{up_addr}")).unwrap();
     let gate_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gate_addr = gate_listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(gate_listener, build_app(config)).await.unwrap() });
@@ -173,6 +178,50 @@ async fn correct_password_sets_cookie_and_redirects_preserving_query() {
     assert!(set_cookie.contains("; Path=/"));
     assert!(set_cookie.contains("; Max-Age=2592000"));
     assert_eq!(h.upstream.hits(), 0);
+}
+
+#[tokio::test]
+async fn each_configured_password_logs_in_with_its_own_cookie() {
+    let h = spawn_with_passwords(&["hunter2", "swordfish"]).await;
+
+    for password in ["hunter2", "swordfish"] {
+        let resp = h
+            .client
+            .post(&h.base)
+            .header("content-type", FORM)
+            .body(login_body(password))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 303, "password: {password}");
+        // The cookie carries the digest of the password actually used.
+        let token = blake3::hash(password.as_bytes()).to_hex().to_string();
+        let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(
+            set_cookie.starts_with(&format!("mba={token}")),
+            "password: {password}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cookie_from_a_non_primary_password_is_proxied() {
+    let h = spawn_with_passwords(&["hunter2", "swordfish"]).await;
+    // A cookie minted from the second configured password authenticates a
+    // proxied request, not just the login.
+    let token = blake3::hash(b"swordfish").to_hex().to_string();
+    let resp = h
+        .client
+        .get(&h.base)
+        .header("cookie", format!("mba={token}"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "UPSTREAM_OK");
+    assert_eq!(h.upstream.hits(), 1);
 }
 
 #[tokio::test]
@@ -404,11 +453,30 @@ async fn raw_request(authority: &str, request: &str) -> String {
 
 // --- Fail-fast startup (child process) -----------------------------------
 
+/// Command for the binary with every `MBA_PASSWORD*` variable removed, so
+/// the child sees only the passwords a test sets explicitly. Every
+/// child-process test must start from this: a child inherits the parent
+/// environment, so a stray `MBA_PASSWORD_*` there could otherwise (a) start
+/// a "no password" test and make `.output()` block forever, or (b) collide
+/// with a test's own password and trip `DuplicatePassword` before the
+/// validation the test is actually checking.
+fn binary_without_passwords() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_mildly-basic-auth"));
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|n| n == "MBA_PASSWORD" || n.starts_with("MBA_PASSWORD_"))
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 #[test]
 fn missing_password_fails_fast() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mildly-basic-auth"))
+    let output = binary_without_passwords()
         .env_remove("MBA_ADDRESS")
-        .env_remove("MBA_PASSWORD")
         .env("MBA_UPSTREAM", "http://127.0.0.1:9")
         .output()
         .unwrap();
@@ -420,7 +488,7 @@ fn missing_password_fails_fast() {
 
 #[test]
 fn missing_upstream_fails_fast() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mildly-basic-auth"))
+    let output = binary_without_passwords()
         .env_remove("MBA_ADDRESS")
         .env("MBA_PASSWORD", PASSWORD)
         .env_remove("MBA_UPSTREAM")
@@ -434,7 +502,7 @@ fn missing_upstream_fails_fast() {
 
 #[test]
 fn invalid_address_fails_fast() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mildly-basic-auth"))
+    let output = binary_without_passwords()
         .env("MBA_ADDRESS", "localhost:4630")
         .env("MBA_PASSWORD", PASSWORD)
         .env("MBA_UPSTREAM", "http://127.0.0.1:9")
@@ -460,7 +528,7 @@ fn custom_address_is_bound() {
         let address = available.local_addr().unwrap();
         drop(available);
 
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mildly-basic-auth"))
+        let mut child = binary_without_passwords()
             .env("MBA_ADDRESS", address.to_string())
             .env("MBA_PASSWORD", &password)
             .env("MBA_UPSTREAM", "http://127.0.0.1:9")
@@ -495,6 +563,83 @@ fn custom_address_is_bound() {
 
     panic!(
         "service did not bind after five attempts:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn suffixed_password_variables_each_authenticate() {
+    // Only suffixed vars, no base `MBA_PASSWORD`: one test proving suffix
+    // discovery, multiple passwords, environment isolation, and that no
+    // base variable is privileged (the child would fail to start if the
+    // base were required).
+    let alice = format!("alice-{}", std::process::id());
+    let bob = format!("bob-{}", std::process::id());
+    let mut failures = Vec::new();
+
+    // Retry the whole attempt if another process wins the allocation-to-bind
+    // gap (same reason as `custom_address_is_bound`).
+    for _ in 0..5 {
+        let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = available.local_addr().unwrap();
+        drop(available);
+
+        let mut child = binary_without_passwords()
+            .env("MBA_ADDRESS", address.to_string())
+            .env("MBA_PASSWORD_ALICE", &alice)
+            .env("MBA_PASSWORD_BOB", &bob)
+            .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut is_serving = false;
+        while std::time::Instant::now() < deadline {
+            if authenticates_at(address, &alice) {
+                is_serving = true;
+                break;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Capture every result before killing, so a failed assertion never
+        // leaves the child process running.
+        let outcome = is_serving.then(|| {
+            (
+                authenticates_at(address, &alice),
+                authenticates_at(address, &bob),
+                !authenticates_at(address, "charlie"),
+            )
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        if let Some((alice_ok, bob_ok, wrong_rejected)) = outcome {
+            assert!(
+                alice_ok,
+                "the `MBA_PASSWORD_ALICE` password did not authenticate"
+            );
+            assert!(
+                bob_ok,
+                "the `MBA_PASSWORD_BOB` password did not authenticate"
+            );
+            assert!(wrong_rejected, "an unconfigured password authenticated");
+            return;
+        }
+        failures.push(format!(
+            "`{address}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    panic!(
+        "service did not serve after five attempts:\n{}",
         failures.join("\n")
     );
 }

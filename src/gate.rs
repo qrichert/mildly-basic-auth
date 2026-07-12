@@ -50,13 +50,13 @@ pub(crate) async fn gate(State(config): State<Config>, request: Request, next: N
     let (mut parts, body) = request.into_parts();
 
     let cookies = parse_cookies(&parts.headers);
-    if authenticate(&cookies, config.session()) {
+    if authenticate(&cookies, config.sessions()) {
         sanitize_request_headers(&mut parts, &cookies);
         return next.run(Request::from_parts(parts, body)).await;
     }
 
     if parts.method == Method::POST {
-        return handle_login(&parts, body, config.session()).await;
+        return handle_login(&parts, body, config.sessions()).await;
     }
 
     wall_response()
@@ -78,13 +78,15 @@ fn sanitize_request_headers(parts: &mut Parts, cookies: &[CookiePair]) {
 /// Handle an unauthenticated `POST`: verify the submitted password and
 /// either start a session or re-serve the wall. The body is capped and
 /// never forwarded upstream.
-async fn handle_login(parts: &Parts, body: Body, session: &Hash) -> Response {
+async fn handle_login(parts: &Parts, body: Body, sessions: &[Hash]) -> Response {
     let Ok(bytes) = to_bytes(body, MAX_LOGIN_BODY).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
-    match extract_submitted_password(&bytes) {
-        Some(password) if password_matches(&password, session) => login_success(parts, session),
-        _ => wall_response(),
+    // Hand `login_success` the digest that actually matched, so the cookie
+    // carries a token that will authenticate on the follow-up request.
+    match extract_submitted_password(&bytes).and_then(|p| matching_session(&p, sessions).copied()) {
+        Some(session) => login_success(parts, &session),
+        None => wall_response(),
     }
 }
 
@@ -143,19 +145,22 @@ fn parse_cookies(headers: &HeaderMap) -> Vec<CookiePair> {
     cookies
 }
 
-/// Authenticated iff any `mba` cookie matches the expected digest.
-fn authenticate(cookies: &[CookiePair], session: &Hash) -> bool {
+/// Authenticated iff any `mba` cookie matches any expected digest.
+fn authenticate(cookies: &[CookiePair], sessions: &[Hash]) -> bool {
     cookies
         .iter()
-        .any(|c| c.name == COOKIE_NAME && cookie_matches_session(&c.value, session))
+        .any(|c| c.name == COOKIE_NAME && cookie_matches_any(&c.value, sessions))
 }
 
-/// Constant-time check that a cookie value is the expected session token.
+/// Constant-time check that a cookie value is one of the expected session
+/// tokens.
 ///
 /// A non-hex value fails to parse and is rejected; `Hash`'s `==` is
-/// constant-time.
-fn cookie_matches_session(value: &str, session: &Hash) -> bool {
-    Hash::from_hex(value).is_ok_and(|presented| presented == *session)
+/// constant-time, and `contains` compares each element with it. The scan is
+/// safe: a wrong cookie always covers the whole list (no timing signal),
+/// and an early exit only happens for a token the caller already presented.
+fn cookie_matches_any(value: &str, sessions: &[Hash]) -> bool {
+    Hash::from_hex(value).is_ok_and(|presented| sessions.contains(&presented))
 }
 
 /// Rebuild the outgoing `Cookie` header from the raw non-`mba` pairs, in
@@ -241,9 +246,14 @@ fn extract_submitted_password(body: &[u8]) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
-/// Constant-time check that the submitted password hashes to the digest.
-fn password_matches(password: &str, session: &Hash) -> bool {
-    blake3::hash(password.as_bytes()) == *session
+/// The configured digest the submitted password hashes to, if any.
+///
+/// Constant-time per candidate (`Hash`'s `==`); the `.find()` short-circuit
+/// only exits early on a password the caller already submitted, so it leaks
+/// nothing about the others.
+fn matching_session<'a>(password: &str, sessions: &'a [Hash]) -> Option<&'a Hash> {
+    let presented = blake3::hash(password.as_bytes());
+    sessions.iter().find(|s| presented == **s)
 }
 
 /// Build the `Set-Cookie` value by hand.
@@ -288,33 +298,33 @@ mod tests {
     #[test]
     fn valid_token_authenticates() {
         let cookies = parse_cookies(&cookie_header(&format!("mba={}", token())));
-        assert!(authenticate(&cookies, &session()));
+        assert!(authenticate(&cookies, &[session()]));
     }
 
     #[test]
     fn wrong_token_does_not_authenticate() {
         let wrong = blake3::hash(b"nope").to_hex().to_string();
         let cookies = parse_cookies(&cookie_header(&format!("mba={wrong}")));
-        assert!(!authenticate(&cookies, &session()));
+        assert!(!authenticate(&cookies, &[session()]));
     }
 
     #[test]
     fn non_hex_token_does_not_authenticate() {
         let cookies = parse_cookies(&cookie_header("mba=not-hex"));
-        assert!(!authenticate(&cookies, &session()));
+        assert!(!authenticate(&cookies, &[session()]));
     }
 
     #[test]
     fn missing_cookie_does_not_authenticate() {
         let cookies = parse_cookies(&HeaderMap::new());
-        assert!(!authenticate(&cookies, &session()));
+        assert!(!authenticate(&cookies, &[session()]));
     }
 
     #[test]
     fn percent_encoded_name_still_authenticates() {
         // `m%62a` decodes to `mba` — auth must see it (so stripping does too).
         let cookies = parse_cookies(&cookie_header(&format!("m%62a={}", token())));
-        assert!(authenticate(&cookies, &session()));
+        assert!(authenticate(&cookies, &[session()]));
     }
 
     #[test]
@@ -364,7 +374,7 @@ mod tests {
             HeaderValue::from_str(&format!("mba={}", token())).unwrap(),
         );
         let cookies = parse_cookies(&headers);
-        assert!(authenticate(&cookies, &session()));
+        assert!(authenticate(&cookies, &[session()]));
         assert_eq!(sanitized_cookie_header(&cookies).unwrap(), "a=1");
     }
 
@@ -376,7 +386,7 @@ mod tests {
             "app=keep; bad=%ff; mba={}",
             token()
         )));
-        assert!(authenticate(&cookies, &session()));
+        assert!(authenticate(&cookies, &[session()]));
         let header = sanitized_cookie_header(&cookies).unwrap();
         assert_eq!(header, "app=keep"); // Malformed `bad` and `mba` both gone.
     }
@@ -384,7 +394,7 @@ mod tests {
     #[test]
     fn only_malformed_cookies_do_not_authenticate() {
         let cookies = parse_cookies(&cookie_header("bad=%ff"));
-        assert!(!authenticate(&cookies, &session()));
+        assert!(!authenticate(&cookies, &[session()]));
         assert!(cookies.is_empty());
     }
 
@@ -514,8 +524,38 @@ mod tests {
     }
 
     #[test]
-    fn password_matches_only_the_configured_password() {
-        assert!(password_matches("hunter2", &session()));
-        assert!(!password_matches("wrong", &session()));
+    fn matching_session_returns_the_configured_digest() {
+        assert_eq!(matching_session("hunter2", &[session()]), Some(&session()));
+    }
+
+    #[test]
+    fn matching_session_picks_the_correct_digest_among_several() {
+        let swordfish = blake3::hash(b"swordfish");
+        let sessions = [session(), swordfish];
+        assert_eq!(matching_session("swordfish", &sessions), Some(&swordfish));
+    }
+
+    #[test]
+    fn matching_session_returns_none_for_a_wrong_password() {
+        assert_eq!(matching_session("wrong", &[session()]), None);
+    }
+
+    #[test]
+    fn authenticates_with_any_of_multiple_configured_passwords() {
+        // A cookie minted from the second password matches the digest set.
+        let swordfish = blake3::hash(b"swordfish");
+        let token = swordfish.to_hex().to_string();
+        let cookies = parse_cookies(&cookie_header(&format!("mba={token}")));
+        assert!(authenticate(&cookies, &[session(), swordfish]));
+    }
+
+    #[test]
+    fn wrong_cookie_does_not_authenticate_against_any() {
+        let wrong = blake3::hash(b"nope").to_hex().to_string();
+        let cookies = parse_cookies(&cookie_header(&format!("mba={wrong}")));
+        assert!(!authenticate(
+            &cookies,
+            &[session(), blake3::hash(b"swordfish")]
+        ));
     }
 }

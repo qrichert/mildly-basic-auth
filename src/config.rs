@@ -3,7 +3,9 @@
 //! `Config` is only constructible when every value is valid, so the rest
 //! of the program never has to defend against a half-configured state.
 
+use std::collections::HashSet;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
 use std::net::SocketAddr;
 
@@ -14,8 +16,15 @@ use blake3::Hash;
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8000";
 /// Environment variable holding the IP socket address to listen on.
 const ENV_ADDRESS: &str = "MBA_ADDRESS";
-/// Environment variable holding the plain password (required, non-empty).
+/// Environment variable holding a plain password. At least one of the
+/// `MBA_PASSWORD*` family (this or a `MBA_PASSWORD_<label>`) must be
+/// non-empty.
 const ENV_PASSWORD: &str = "MBA_PASSWORD";
+/// Prefix for additional password variables, e.g. `MBA_PASSWORD_BOB`. The
+/// suffix is a free-form label (typically who the password belongs to);
+/// it carries no meaning at request time. Reserved: future config must
+/// not land under `MBA_PASSWORD_*` or it would be read as a password.
+const ENV_PASSWORD_PREFIX: &str = "MBA_PASSWORD_";
 /// Environment variable holding the upstream URL (required, absolute
 /// `http(s)://host[:port]`).
 const ENV_UPSTREAM: &str = "MBA_UPSTREAM";
@@ -23,18 +32,22 @@ const ENV_UPSTREAM: &str = "MBA_UPSTREAM";
 /// Immutable runtime configuration, built once at startup.
 ///
 /// Cloned per request by the gate middleware (`from_fn_with_state`
-/// requires the state to be `Clone`), which is why fields are cheap to
-/// copy/clone (`Hash` and `SocketAddr` are `Copy`, `String` is `Clone`).
+/// requires the state to be `Clone`), which is why fields stay cheap to
+/// clone (`SocketAddr` is `Copy`; `Vec<Hash>` and `String` each clone one
+/// small heap allocation per request).
 #[derive(Clone)]
 pub struct Config {
     /// Validated IP socket address the service listens on.
     bind_address: SocketAddr,
-    /// BLAKE3 digest of the configured password. The session cookie
-    /// carries this same value as hex; a request authenticates by
-    /// presenting a cookie that matches it. Storing the digest (not the
-    /// password) keeps the plaintext out of memory after startup and out
-    /// of the browser jar.
-    session: Hash,
+    /// BLAKE3 digests of the configured passwords. The session cookie
+    /// carries one of these as hex; a request authenticates by presenting
+    /// a cookie that matches **any** of them. `Config` stores only the
+    /// digests, not the plaintext. The cookie is not harmless: it never
+    /// contains the plaintext password, but it holds a password-equivalent
+    /// bearer token and remains sensitive (see the `Debug` redaction
+    /// below). This is not memory scrubbing — the plaintext still lives in
+    /// the process environment.
+    sessions: Vec<Hash>,
     /// Validated absolute `http(s)://host[:port]` upstream. Stored as a
     /// `String` (not `Uri`) because `ReverseProxy::new` takes one generic
     /// `S: Into<String>` for both arguments; a `&Uri` would not satisfy
@@ -50,7 +63,8 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`ConfigError`] if `MBA_ADDRESS` is not a valid non-zero IP
-    /// socket address, `MBA_PASSWORD` is empty, or `MBA_UPSTREAM` is not a
+    /// socket address, no `MBA_PASSWORD*` variable has a non-empty UTF-8
+    /// value, two of them share the same value, or `MBA_UPSTREAM` is not a
     /// valid absolute HTTP(S) URL.
     pub fn from_env() -> Result<Self, ConfigError> {
         let address = match std::env::var(ENV_ADDRESS) {
@@ -63,9 +77,10 @@ impl Config {
                 });
             }
         };
-        let password = std::env::var(ENV_PASSWORD).unwrap_or_default();
+        let passwords = passwords_from_env(std::env::vars_os());
+        let passwords: Vec<&str> = passwords.iter().map(String::as_str).collect();
         let upstream = std::env::var(ENV_UPSTREAM).unwrap_or_default();
-        Self::from_values_and_address(&password, &upstream, &address)
+        Self::from_passwords_and_address(&passwords, &upstream, &address)
     }
 
     /// Build and validate from explicit values (pure, env-free).
@@ -89,33 +104,89 @@ impl Config {
         Self::from_values_and_address(password, upstream, DEFAULT_BIND_ADDRESS)
     }
 
+    /// Build and validate from several explicit passwords (pure, env-free).
+    /// Empty entries are ignored; at least one must remain, and all must be
+    /// distinct. Any of them authenticates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use mildly_basic_auth::Config;
+    /// assert!(Config::from_passwords(&["alice", "bob"], "http://app:2001").is_ok());
+    /// assert!(Config::from_passwords(&[], "http://app:2001").is_err()); // No password.
+    /// assert!(Config::from_passwords(&["x", "x"], "http://app:2001").is_err()); // Duplicate.
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::MissingPassword`] if no password is non-empty,
+    /// [`ConfigError::DuplicatePassword`] if two passwords share a value, or
+    /// [`ConfigError::MissingUpstream`] / [`ConfigError::InvalidUpstream`]
+    /// if the upstream is not a valid absolute HTTP(S) URL. The bind
+    /// address uses the default `0.0.0.0:8000`.
+    pub fn from_passwords(passwords: &[&str], upstream: &str) -> Result<Self, ConfigError> {
+        Self::from_passwords_and_address(passwords, upstream, DEFAULT_BIND_ADDRESS)
+    }
+
     /// Validated IP socket address the service listens on.
     #[must_use]
     pub fn bind_address(&self) -> SocketAddr {
         self.bind_address
     }
 
-    /// Build and validate the complete runtime configuration.
+    /// Build and validate the complete runtime configuration from a single
+    /// password.
     fn from_values_and_address(
         password: &str,
         upstream: &str,
         address: &str,
     ) -> Result<Self, ConfigError> {
-        if password.is_empty() {
+        Self::from_passwords_and_address(&[password], upstream, address)
+    }
+
+    /// Build and validate the complete runtime configuration.
+    fn from_passwords_and_address(
+        passwords: &[&str],
+        upstream: &str,
+        address: &str,
+    ) -> Result<Self, ConfigError> {
+        // Keep non-empty values (drop unset/blank vars).
+        let passwords: Vec<&str> = passwords
+            .iter()
+            .copied()
+            .filter(|p| !p.is_empty())
+            .collect();
+        if passwords.is_empty() {
             return Err(ConfigError::MissingPassword);
         }
+        // Reject duplicates: two variables sharing a value hash to the same
+        // digest, so removing one would not revoke the other — breaking
+        // independent revocation. Startup-time over operator input, so a
+        // `HashSet` compare (not constant-time) is fine; this is not the
+        // request path.
+        let unique: HashSet<&str> = passwords.iter().copied().collect();
+        if unique.len() != passwords.len() {
+            return Err(ConfigError::DuplicatePassword);
+        }
+        // Only the digests are retained in `Config`; the plaintext stays
+        // with the caller and the process environment (not scrubbed here).
+        let sessions: Vec<Hash> = passwords
+            .iter()
+            .map(|p| blake3::hash(p.as_bytes()))
+            .collect();
         let upstream = validate_upstream(upstream)?;
         let address = validate_address(address)?;
         Ok(Self {
             bind_address: address,
-            session: blake3::hash(password.as_bytes()),
+            sessions,
             upstream,
         })
     }
 
-    /// Expected session-cookie digest.
-    pub(crate) fn session(&self) -> &Hash {
-        &self.session
+    /// Expected session-cookie digests. A request authenticates by matching
+    /// any of them.
+    pub(crate) fn sessions(&self) -> &[Hash] {
+        &self.sessions
     }
 
     /// Validated upstream URL, ready for `ReverseProxy::new`.
@@ -126,14 +197,36 @@ impl Config {
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Never print the session digest: it is a password-equivalent
+        // Never print the session digests: each is a password-equivalent
         // bearer token, so an accidental log must not leak it.
         f.debug_struct("Config")
             .field("bind_address", &self.bind_address)
-            .field("session", &"<redacted>")
+            .field("sessions", &"<redacted>")
             .field("upstream", &self.upstream)
             .finish()
     }
+}
+
+/// Every configured password from the environment: `MBA_PASSWORD` and any
+/// name starting with `MBA_PASSWORD_`. Order is irrelevant (any match
+/// authenticates); empty values are dropped downstream. Non-Unicode names
+/// never match; non-Unicode values are skipped (a form-entered password is
+/// always UTF-8, so such a value is unusable anyway).
+///
+/// Pure over the iterator so it is testable without mutating process-wide
+/// env (which is `unsafe` in Rust 2024). `from_env` calls it with
+/// `std::env::vars_os()` — `vars_os` (not `vars`) because `vars` panics on
+/// any non-Unicode variable anywhere in the environment.
+fn passwords_from_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<String> {
+    vars.filter_map(|(name, value)| {
+        // Filter by name *before* touching the value, so an unrelated
+        // non-Unicode variable can never reach `into_string`.
+        let name = name.to_str()?;
+        (name == ENV_PASSWORD || name.starts_with(ENV_PASSWORD_PREFIX))
+            .then(|| value.into_string().ok())
+            .flatten()
+    })
+    .collect()
 }
 
 /// Validate `address` as a non-zero IP socket address.
@@ -234,8 +327,11 @@ fn validate_upstream(upstream: &str) -> Result<String, ConfigError> {
 pub enum ConfigError {
     /// `MBA_ADDRESS` was not a valid non-zero IP socket address.
     InvalidAddress { value: String, reason: &'static str },
-    /// `MBA_PASSWORD` was unset or empty.
+    /// No `MBA_PASSWORD*` variable had a non-empty UTF-8 value.
     MissingPassword,
+    /// Two `MBA_PASSWORD*` variables shared the same value, which would
+    /// break independent revocation.
+    DuplicatePassword,
     /// `MBA_UPSTREAM` was unset or empty.
     MissingUpstream,
     /// `MBA_UPSTREAM` was set but is not an absolute HTTP(S) URL.
@@ -249,9 +345,16 @@ impl fmt::Display for ConfigError {
                 f,
                 "`{ENV_ADDRESS}` is not a valid IP socket address ({reason}): {value:?}"
             ),
-            Self::MissingPassword => {
-                write!(f, "`{ENV_PASSWORD}` must be set to a non-empty value")
-            }
+            Self::MissingPassword => write!(
+                f,
+                "at least one password variable (`{ENV_PASSWORD}` or \
+                 `{ENV_PASSWORD_PREFIX}<label>`) must have a non-empty UTF-8 value"
+            ),
+            Self::DuplicatePassword => write!(
+                f,
+                "two password variables share the same value; each password \
+                 must be distinct to be revoked independently"
+            ),
             Self::MissingUpstream => write!(f, "`{ENV_UPSTREAM}` must be set"),
             Self::InvalidUpstream { value, reason } => write!(
                 f,
@@ -476,7 +579,98 @@ mod tests {
     #[test]
     fn session_digest_matches_blake3_of_password() {
         let config = Config::from_values("hunter2", "http://app:2001").unwrap();
-        assert_eq!(config.session(), &blake3::hash(b"hunter2"));
+        assert_eq!(config.sessions(), &[blake3::hash(b"hunter2")]);
+    }
+
+    #[test]
+    fn multiple_passwords_build_one_digest_each() {
+        let config = Config::from_passwords(&["hunter2", "swordfish"], "http://app:2001").unwrap();
+        assert_eq!(
+            config.sessions(),
+            &[blake3::hash(b"hunter2"), blake3::hash(b"swordfish")]
+        );
+    }
+
+    #[test]
+    fn empty_passwords_are_filtered_out() {
+        let config = Config::from_passwords(&["", "hunter2", ""], "http://app:2001").unwrap();
+        assert_eq!(config.sessions(), &[blake3::hash(b"hunter2")]);
+    }
+
+    #[test]
+    fn all_empty_passwords_are_rejected() {
+        assert_matches!(
+            Config::from_passwords(&["", ""], "http://app:2001"),
+            Err(ConfigError::MissingPassword)
+        );
+    }
+
+    #[test]
+    fn no_passwords_are_rejected() {
+        assert_matches!(
+            Config::from_passwords(&[], "http://app:2001"),
+            Err(ConfigError::MissingPassword)
+        );
+    }
+
+    #[test]
+    fn duplicate_passwords_are_rejected() {
+        assert_matches!(
+            Config::from_passwords(&["hunter2", "hunter2"], "http://app:2001"),
+            Err(ConfigError::DuplicatePassword)
+        );
+    }
+
+    #[test]
+    fn duplicate_check_ignores_filtered_empties() {
+        // The two empties are dropped before the duplicate check, so they
+        // are not treated as duplicates of each other.
+        assert!(Config::from_passwords(&["a", "", ""], "http://app:2001").is_ok());
+    }
+
+    #[test]
+    fn passwords_from_env_collects_base_and_suffixed() {
+        let vars = [
+            ("MBA_PASSWORD", "alpha"),
+            ("MBA_PASSWORD_BOB", "bravo"),
+            ("MBA_ADDRESS", "0.0.0.0:8000"),
+            ("MBA_UPSTREAM", "http://app:2001"),
+            ("PATH", "/usr/bin"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let mut got = passwords_from_env(vars);
+        got.sort();
+        assert_eq!(got, ["alpha".to_string(), "bravo".to_string()]);
+    }
+
+    #[test]
+    fn passwords_from_env_keeps_empty_values_for_later_filtering() {
+        // The scanner is not where empties are dropped; the constructor is.
+        let vars = [("MBA_PASSWORD_BOB", "")]
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        assert_eq!(passwords_from_env(vars), [String::new()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passwords_from_env_skips_non_unicode_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+
+        // An unrelated variable with a non-Unicode *name*, and a
+        // `MBA_PASSWORD_*` with a non-Unicode *value*: both must be skipped
+        // (not panic), while a valid entry alongside them still collects.
+        let vars = vec![
+            (OsString::from_vec(vec![0xff]), OsString::from("ignored")),
+            (
+                OsString::from("MBA_PASSWORD_BAD"),
+                OsString::from_vec(vec![0xff]),
+            ),
+            (OsString::from("MBA_PASSWORD"), OsString::from("alpha")),
+        ]
+        .into_iter();
+        assert_eq!(passwords_from_env(vars), ["alpha".to_string()]);
     }
 
     #[test]

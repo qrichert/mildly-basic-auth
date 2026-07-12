@@ -35,17 +35,18 @@ keep strangers out of a work-in-progress project or some personal docs.
 
 ## Philosophy: stupid simple
 
-One environment variable for the password, one for the upstream. No
-config file to learn, no docs to read, no accounts, no database, no
+One or more environment variables for passwords, one for the upstream.
+No config file to learn, no docs to read, no accounts, no database, no
 Redis. Drop the container in front of your app and it works.
 
 Everything else follows from that:
 
 - The login page is a single self-contained HTML file (inline CSS and
   SVG, no external requests — the wall never phones home).
-- Sessions are stateless. The cookie is a digest of the password, so
-  there is nothing to persist, and rotating the password invalidates
-  every session for free.
+- Sessions are stateless. The cookie is a digest of the password used to
+  log in, so there is nothing to persist, and rotating (or removing) a
+  password invalidates only the sessions created with it — the others
+  keep working.
 - Authenticated traffic passes through untouched, streaming and
   WebSockets included.
 
@@ -81,6 +82,35 @@ Use a long, random `MBA_PASSWORD`, not something guessable like the
 `Tr0ub4dor&3` above. The session cookie is a fast digest of the
 password, so a leaked cookie is an offline verifier of it — a strong
 secret stays safe, a weak one does not.
+
+### Multiple passwords
+
+Give each person or system its own password by adding
+`MBA_PASSWORD_<label>` variables — the `<label>` is a free-form tag
+(typically who it is for). Any of them logs in; there is no privileged
+base variable, and the passwords must be distinct (startup rejects
+duplicates so each can be revoked on its own):
+
+```yml
+services:
+  auth-gate:
+    image: qrichert/mildly-basic-auth:latest
+    ports:
+      - "80:8000"
+    environment:
+      MBA_PASSWORD_ALICE: ${ALICE_PASSWORD:?set a strong password}
+      MBA_PASSWORD_BOB: ${BOB_PASSWORD:?set a strong password}
+      MBA_UPSTREAM: http://app:2001
+  app:
+    image: traefik/whoami
+    command:
+      - "--port=2001"
+```
+
+Delete a variable and restart to revoke the sessions created with that
+password; the others keep working. The label is only for you: the gate
+authenticates anonymously and never learns who is behind a request, so
+revocation is per-password, not per-person.
 
 ### Behind Caddy (TLS)
 
@@ -131,18 +161,29 @@ $ MBA_PASSWORD='…' MBA_UPSTREAM='http://127.0.0.1:2001' mildly-basic-auth
 
 ## Configuration
 
-| Variable       | Required | Description                                      |
-| -------------- | -------- | ------------------------------------------------ |
-| `MBA_ADDRESS`  | no       | IP and port to bind. Defaults to `0.0.0.0:8000`. |
-| `MBA_PASSWORD` | yes      | The password. Startup fails if unset or empty.   |
-| `MBA_UPSTREAM` | yes      | Absolute `http(s)://host[:port]` to forward to.  |
+| Variable       | Required | Description                                        |
+| -------------- | -------- | -------------------------------------------------- |
+| `MBA_PASSWORD` | yes\*    | A password. Any configured password grants access. |
+| `MBA_UPSTREAM` | yes      | Absolute `http(s)://host[:port]` to forward to.    |
+
+| Variable             | Required | Description                                           |
+| -------------------- | -------- | ----------------------------------------------------- |
+| `MBA_ADDRESS`        | no       | IP and port to bind. Defaults to `0.0.0.0:8000`.      |
+| `MBA_PASSWORD_<tag>` | no       | An additional password; `<tag>` is a free-form label. |
+
+\* At least one password must be set — `MBA_PASSWORD` or any
+`MBA_PASSWORD_<tag>`; there is no privileged base variable. Passwords
+must be distinct: startup rejects duplicates so each can be revoked
+independently. Any of them logs in; removing a variable revokes the
+sessions created with it.
 
 `MBA_ADDRESS` accepts a concrete IPv4 or bracketed IPv6 address, not a
 hostname, and the port must not be zero.
 
-A missing or empty required variable or an invalid `MBA_ADDRESS` is a
-hard startup error, not a silent passthrough — the point is protection,
-so a misconfiguration fails loud instead of leaving the door open.
+A missing or empty required variable, a duplicate password, or an
+invalid `MBA_ADDRESS` is a hard startup error, not a silent passthrough
+— the point is protection, so a misconfiguration fails loud instead of
+leaving the door open.
 
 The container listens on `0.0.0.0:8000` by default and runs as a
 non-root user (UID `10001`) on a Debian-slim image.[^debian]
@@ -155,10 +196,16 @@ non-root user (UID `10001`) on a Debian-slim image.[^debian]
 
 ## Roadmap
 
-v0 is plain-password-in-an-env-var with a fixed template. Planned next:
+v0 is plain-passwords-in-env-vars with a fixed template. Planned next:
 
-- **More auth methods:** hashed password (`<algo>:<hash>`), multiple
-  user/password pairs, and possibly a header-only bearer-token check.
+- **More auth methods:** pre-hashed passwords, and possibly a
+  header-only bearer-token check. Pre-hashed passwords will be
+  BLAKE3-only — the login path hashes with BLAKE3 and the cookie _is_
+  that digest, so no other algorithm could match. A possible explicit
+  format is `blake3:<hex>`; the exact syntax remains undecided. A
+  pre-hash is still a password-equivalent bearer secret: it keeps the
+  plaintext out of configuration but does not make configuration
+  disclosure harmless.
 - **Config beyond env vars:** an env file or a YAML config file (via
   `MBA_CONFIG_FILE` or discovery).
 - **Custom template:** full override via `MBA_TEMPLATE_FILE` or a bind
