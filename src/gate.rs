@@ -5,7 +5,7 @@
 //! wall. The gate reads only the `Cookie` *header* on the fast path, so
 //! streaming, `WebSockets`, and SSE are preserved.
 
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::header::{COOKIE, HOST, SET_COOKIE};
 use axum::http::request::Parts;
@@ -17,10 +17,6 @@ use blake3::Hash;
 use cookie::Cookie;
 
 use crate::config::Config;
-
-/// Embedded password page. Compiled in via `include_str!`, so the binary
-/// carries no runtime asset dependency.
-const WALL: &str = include_str!("index.html");
 
 /// Session cookie name. Deliberately not `password`/`wall`: those words
 /// trip iOS Safari's Intelligent Tracking Prevention, which silently
@@ -56,10 +52,10 @@ pub(crate) async fn gate(State(config): State<Config>, request: Request, next: N
     }
 
     if parts.method == Method::POST {
-        return handle_login(&parts, body, config.sessions()).await;
+        return handle_login(&parts, body, config.sessions(), config.wall()).await;
     }
 
-    wall_response()
+    wall_response(config.wall().clone())
 }
 
 /// Rewrite the outgoing headers of an authenticated request: strip our
@@ -78,7 +74,7 @@ fn sanitize_request_headers(parts: &mut Parts, cookies: &[CookiePair]) {
 /// Handle an unauthenticated `POST`: verify the submitted password and
 /// either start a session or re-serve the wall. The body is capped and
 /// never forwarded upstream.
-async fn handle_login(parts: &Parts, body: Body, sessions: &[Hash]) -> Response {
+async fn handle_login(parts: &Parts, body: Body, sessions: &[Hash], wall: &Bytes) -> Response {
     let Ok(bytes) = to_bytes(body, MAX_LOGIN_BODY).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
@@ -86,7 +82,7 @@ async fn handle_login(parts: &Parts, body: Body, sessions: &[Hash]) -> Response 
     // carries a token that will authenticate on the follow-up request.
     match extract_submitted_password(&bytes).and_then(|p| matching_session(&p, sessions).copied()) {
         Some(session) => login_success(parts, &session),
-        None => wall_response(),
+        None => wall_response(wall.clone()),
     }
 }
 
@@ -105,8 +101,8 @@ fn login_success(parts: &Parts, session: &Hash) -> Response {
 /// The password page: `401` with an explicit HTML content type, and
 /// deliberately no `WWW-Authenticate` (which would pop the browser's
 /// native Basic-auth dialog — the very UX we're replacing).
-fn wall_response() -> Response {
-    (StatusCode::UNAUTHORIZED, Html(WALL)).into_response()
+fn wall_response(wall: Bytes) -> Response {
+    (StatusCode::UNAUTHORIZED, Html(wall)).into_response()
 }
 
 /// A single parsed request cookie: decoded name/value for classification

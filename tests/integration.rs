@@ -451,6 +451,102 @@ async fn raw_request(authority: &str, request: &str) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+#[test]
+fn template_text_variables_customize_every_wall_response() {
+    let password = format!("template-text-test-{}", std::process::id());
+    let mut failures = Vec::new();
+
+    // Retry the complete attempt if another process wins the allocation-to-
+    // bind gap (same reason as `custom_address_is_bound`).
+    for _ in 0..5 {
+        let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = available.local_addr().unwrap();
+        drop(available);
+
+        let mut child = binary_without_passwords()
+            .env("MBA_ADDRESS", address.to_string())
+            .env("MBA_PASSWORD", &password)
+            .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+            .env("MBA_TEMPLATE_PAGE_LANGUAGE", "fr")
+            .env("MBA_TEMPLATE_PAGE_TITLE", "Mon site")
+            .env("MBA_TEMPLATE_PASSWORD_LABEL", "Mot de passe")
+            .env("MBA_TEMPLATE_PASSWORD_PLACEHOLDER", "Votre mot de passe")
+            .env("MBA_TEMPLATE_SUBMIT_BUTTON_TEXT", "Entrer")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let get_request = format!("GET / HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut get_response = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(response) = blocking_request(address, &get_request)
+                && response.starts_with("HTTP/1.1 401 Unauthorized")
+            {
+                get_response = Some(response);
+                break;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let post_response = get_response.as_ref().and_then(|_| {
+            let body = "password=wrong";
+            let request = format!(
+                "POST / HTTP/1.1\r\nHost: {address}\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            blocking_request(address, &request)
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        if let (Some(get_response), Some(post_response)) = (get_response, post_response) {
+            assert!(post_response.starts_with("HTTP/1.1 401 Unauthorized"));
+            let get_body = get_response.split_once("\r\n\r\n").unwrap().1;
+            let post_body = post_response.split_once("\r\n\r\n").unwrap().1;
+            assert_eq!(get_body, post_body);
+            assert!(get_body.contains("<html lang=\"fr\">"));
+            assert!(get_body.contains("<title>Mon site</title>"));
+            assert!(get_body.contains(">Mot de passe</label>"));
+            assert!(get_body.contains("placeholder=\"Votre mot de passe\""));
+            assert!(get_body.contains(">Entrer</button>"));
+            return;
+        }
+        failures.push(format!(
+            "`{address}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    panic!(
+        "service did not serve the customized wall after five attempts:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Send one blocking request to a child-process gate, returning its full
+/// response when the listener is available.
+fn blocking_request(address: std::net::SocketAddr, request: &str) -> Option<String> {
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(50))
+            .ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+        .ok()?;
+    std::io::Write::write_all(&mut stream, request.as_bytes()).ok()?;
+
+    let mut response = Vec::new();
+    std::io::Read::read_to_end(&mut stream, &mut response).ok()?;
+    Some(String::from_utf8_lossy(&response).into_owned())
+}
+
 // --- Fail-fast startup (child process) -----------------------------------
 
 /// Command for the binary with every `MBA_PASSWORD*` variable removed, so

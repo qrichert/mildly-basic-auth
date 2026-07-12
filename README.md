@@ -161,10 +161,14 @@ $ MBA_PASSWORD='…' MBA_UPSTREAM='http://127.0.0.1:2001' mildly-basic-auth
 
 ## Configuration
 
+### Required
+
 | Variable       | Required | Description                                        |
 | -------------- | -------- | -------------------------------------------------- |
 | `MBA_PASSWORD` | yes\*    | A password. Any configured password grants access. |
 | `MBA_UPSTREAM` | yes      | Absolute `http(s)://host[:port]` to forward to.    |
+
+### General
 
 | Variable             | Required | Description                                           |
 | -------------------- | -------- | ----------------------------------------------------- |
@@ -194,6 +198,35 @@ non-root user (UID `10001`) on a Debian-slim image.[^debian]
     pure-Rust TLS stack (rustls + blake3, no OpenSSL) means Alpine's
     usual glibc/OpenSSL payoff does not apply here.
 
+### Template
+
+The built-in password page can be translated or renamed without
+replacing its HTML:
+
+| Variable                            | Default    | Description                               |
+| ----------------------------------- | ---------- | ----------------------------------------- |
+| `MBA_TEMPLATE_PAGE_LANGUAGE`        | `en`       | Document language used by assistive tech. |
+| `MBA_TEMPLATE_PAGE_TITLE`           | `Welcome!` | Browser tab title.                        |
+| `MBA_TEMPLATE_PASSWORD_LABEL`       | `Password` | Accessible password-field label.          |
+| `MBA_TEMPLATE_PASSWORD_PLACEHOLDER` | `Password` | Visible password-field placeholder.       |
+| `MBA_TEMPLATE_SUBMIT_BUTTON_TEXT`   | `Enter`    | Submit-button text.                       |
+
+For example:
+
+```yaml
+environment:
+  MBA_TEMPLATE_PAGE_LANGUAGE: "fr"
+  MBA_TEMPLATE_PAGE_TITLE: "Mon site"
+  MBA_TEMPLATE_PASSWORD_LABEL: "Mot de passe"
+  MBA_TEMPLATE_PASSWORD_PLACEHOLDER: "Votre mot de passe"
+  MBA_TEMPLATE_SUBMIT_BUTTON_TEXT: "Entrer"
+```
+
+An unset variable uses its default. An explicitly empty value removes
+that text. Values are inserted as text, not HTML, and are escaped before
+the page is served. A configured override that is not valid Unicode is a
+startup error.
+
 ## Roadmap
 
 v0 is plain-passwords-in-env-vars with a fixed template. Planned next:
@@ -212,8 +245,6 @@ v0 is plain-passwords-in-env-vars with a fixed template. Planned next:
   mount to `/etc/template.html`, loaded at startup, with a template
   engine to interpolate variables and conditionally render fields per
   auth method.
-- **Page customization** without a custom template: language, title,
-  placeholder — enough to translate the page.
 - **More settings:** auth method, logging on/off, session lifetime.
 - **Authentication hardening:** optional failed-login throttling, once
   trusted client-IP handling is configurable.

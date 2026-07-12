@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="en">
+<html lang="{{PAGE_LANGUAGE}}">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="robots" content="noindex, nofollow" />
-    <title>Welcome!</title>
+    <title>{{PAGE_TITLE}}</title>
     <!--
       No external resources: the unauthenticated wall must not phone home
       (leaking the visitor IP and protected origin before login).
@@ -231,17 +231,17 @@
           <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
         </svg>
         <form class="form" method="post">
-          <label class="sr-only" for="password">Password</label>
+          <label class="sr-only" for="password">{{PASSWORD_LABEL}}</label>
           <input
             class="input"
             id="password"
             type="password"
             name="password"
-            placeholder="Password"
+            placeholder="{{PASSWORD_PLACEHOLDER}}"
             autocomplete="current-password"
             required
           />
-          <button class="button" type="submit">Enter</button>
+          <button class="button" type="submit">{{SUBMIT_BUTTON_TEXT}}</button>
         </form>
       </div>
     </main>

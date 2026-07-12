@@ -9,9 +9,13 @@ use std::ffi::OsString;
 use std::fmt;
 use std::net::SocketAddr;
 
+use axum::body::Bytes;
 use axum::http::Uri;
 use blake3::Hash;
 
+/// Embedded password-page template. Compiled into the binary so rendering
+/// has no runtime asset dependency.
+const WALL_TEMPLATE: &str = include_str!("index.html");
 /// Default IP socket address the service listens on.
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8000";
 /// Environment variable holding the IP socket address to listen on.
@@ -25,6 +29,16 @@ const ENV_PASSWORD: &str = "MBA_PASSWORD";
 /// it carries no meaning at request time. Reserved: future config must
 /// not land under `MBA_PASSWORD_*` or it would be read as a password.
 const ENV_PASSWORD_PREFIX: &str = "MBA_PASSWORD_";
+/// Environment variable overriding the password page's document language.
+const ENV_TEMPLATE_PAGE_LANGUAGE: &str = "MBA_TEMPLATE_PAGE_LANGUAGE";
+/// Environment variable overriding the password page's title.
+const ENV_TEMPLATE_PAGE_TITLE: &str = "MBA_TEMPLATE_PAGE_TITLE";
+/// Environment variable overriding the password field's accessible label.
+const ENV_TEMPLATE_PASSWORD_LABEL: &str = "MBA_TEMPLATE_PASSWORD_LABEL";
+/// Environment variable overriding the password field's placeholder.
+const ENV_TEMPLATE_PASSWORD_PLACEHOLDER: &str = "MBA_TEMPLATE_PASSWORD_PLACEHOLDER";
+/// Environment variable overriding the submit button's text.
+const ENV_TEMPLATE_SUBMIT_BUTTON_TEXT: &str = "MBA_TEMPLATE_SUBMIT_BUTTON_TEXT";
 /// Environment variable holding the upstream URL (required, absolute
 /// `http(s)://host[:port]`).
 const ENV_UPSTREAM: &str = "MBA_UPSTREAM";
@@ -33,8 +47,8 @@ const ENV_UPSTREAM: &str = "MBA_UPSTREAM";
 ///
 /// Cloned per request by the gate middleware (`from_fn_with_state`
 /// requires the state to be `Clone`), which is why fields stay cheap to
-/// clone (`SocketAddr` is `Copy`; `Vec<Hash>` and `String` each clone one
-/// small heap allocation per request).
+/// clone (`SocketAddr` is `Copy`; `Bytes` is reference-counted; `Vec<Hash>`
+/// and `String` each clone one small heap allocation per request).
 #[derive(Clone)]
 pub struct Config {
     /// Validated IP socket address the service listens on.
@@ -53,6 +67,9 @@ pub struct Config {
     /// `S: Into<String>` for both arguments; a `&Uri` would not satisfy
     /// that bound.
     upstream: String,
+    /// Password page rendered once at startup. `Bytes` keeps per-response
+    /// and per-state clones cheap despite the page's size.
+    wall: Bytes,
 }
 
 impl Config {
@@ -64,8 +81,9 @@ impl Config {
     ///
     /// Returns [`ConfigError`] if `MBA_ADDRESS` is not a valid non-zero IP
     /// socket address, no `MBA_PASSWORD*` variable has a non-empty UTF-8
-    /// value, two of them share the same value, or `MBA_UPSTREAM` is not a
-    /// valid absolute HTTP(S) URL.
+    /// value, two of them share the same value, a template-text override is
+    /// not valid Unicode, or `MBA_UPSTREAM` is not a valid absolute HTTP(S)
+    /// URL.
     pub fn from_env() -> Result<Self, ConfigError> {
         let address = match std::env::var(ENV_ADDRESS) {
             Ok(address) => address,
@@ -79,8 +97,14 @@ impl Config {
         };
         let passwords = passwords_from_env(std::env::vars_os());
         let passwords: Vec<&str> = passwords.iter().map(String::as_str).collect();
+        let template_text = TemplateText::from_env(std::env::vars_os())?;
         let upstream = std::env::var(ENV_UPSTREAM).unwrap_or_default();
-        Self::from_passwords_and_address(&passwords, &upstream, &address)
+        Self::from_passwords_address_and_template_text(
+            &passwords,
+            &upstream,
+            &address,
+            &template_text,
+        )
     }
 
     /// Build and validate from explicit values (pure, env-free).
@@ -150,6 +174,22 @@ impl Config {
         upstream: &str,
         address: &str,
     ) -> Result<Self, ConfigError> {
+        Self::from_passwords_address_and_template_text(
+            passwords,
+            upstream,
+            address,
+            &TemplateText::default(),
+        )
+    }
+
+    /// Build and validate the complete runtime configuration with explicit
+    /// password-page text.
+    fn from_passwords_address_and_template_text(
+        passwords: &[&str],
+        upstream: &str,
+        address: &str,
+        template_text: &TemplateText,
+    ) -> Result<Self, ConfigError> {
         // Keep non-empty values (drop unset/blank vars).
         let passwords: Vec<&str> = passwords
             .iter()
@@ -180,6 +220,7 @@ impl Config {
             bind_address: address,
             sessions,
             upstream,
+            wall: render_template(WALL_TEMPLATE, template_text),
         })
     }
 
@@ -193,6 +234,11 @@ impl Config {
     pub(crate) fn upstream(&self) -> &str {
         &self.upstream
     }
+
+    /// Rendered password page, ready to use as an HTML response body.
+    pub(crate) fn wall(&self) -> &Bytes {
+        &self.wall
+    }
 }
 
 impl fmt::Debug for Config {
@@ -203,7 +249,105 @@ impl fmt::Debug for Config {
             .field("bind_address", &self.bind_address)
             .field("sessions", &"<redacted>")
             .field("upstream", &self.upstream)
+            .field("wall", &"<rendered HTML>")
             .finish()
+    }
+}
+
+/// Text substituted into the password-page template.
+struct TemplateText {
+    page_language: String,
+    page_title: String,
+    password_label: String,
+    password_placeholder: String,
+    submit_button_text: String,
+}
+
+impl TemplateText {
+    /// Read fixed template-text overrides from the environment. Unknown
+    /// `MBA_TEMPLATE_*` variables are deliberately ignored: the prefix is
+    /// reserved for explicit settings, including the future template file.
+    fn from_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Result<Self, ConfigError> {
+        let mut text = Self::default();
+        for (name, value) in vars {
+            let Some(name) = name.to_str() else { continue };
+            let target = match name {
+                ENV_TEMPLATE_PAGE_LANGUAGE => &mut text.page_language,
+                ENV_TEMPLATE_PAGE_TITLE => &mut text.page_title,
+                ENV_TEMPLATE_PASSWORD_LABEL => &mut text.password_label,
+                ENV_TEMPLATE_PASSWORD_PLACEHOLDER => &mut text.password_placeholder,
+                ENV_TEMPLATE_SUBMIT_BUTTON_TEXT => &mut text.submit_button_text,
+                _ => continue,
+            };
+            *target = value
+                .into_string()
+                .map_err(|_| ConfigError::InvalidTemplateText {
+                    variable: name.to_owned(),
+                })?;
+        }
+        Ok(text)
+    }
+}
+
+impl Default for TemplateText {
+    fn default() -> Self {
+        Self {
+            page_language: "en".to_owned(),
+            page_title: "Welcome!".to_owned(),
+            password_label: "Password".to_owned(),
+            password_placeholder: "Password".to_owned(),
+            submit_button_text: "Enter".to_owned(),
+        }
+    }
+}
+
+/// Render known markers from `template`, preserving unknown or absent
+/// markers. Scanning only the original template ensures marker-like text
+/// in an override is not interpreted recursively.
+fn render_template(template: &str, text: &TemplateText) -> Bytes {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+
+    while let Some(marker_start) = remaining.find("{{") {
+        rendered.push_str(&remaining[..marker_start]);
+        remaining = &remaining[marker_start..];
+
+        let replacement = [
+            ("{{PAGE_LANGUAGE}}", text.page_language.as_str()),
+            ("{{PAGE_TITLE}}", text.page_title.as_str()),
+            ("{{PASSWORD_LABEL}}", text.password_label.as_str()),
+            (
+                "{{PASSWORD_PLACEHOLDER}}",
+                text.password_placeholder.as_str(),
+            ),
+            ("{{SUBMIT_BUTTON_TEXT}}", text.submit_button_text.as_str()),
+        ]
+        .into_iter()
+        .find(|(marker, _)| remaining.starts_with(marker));
+
+        if let Some((marker, value)) = replacement {
+            push_html_escaped(&mut rendered, value);
+            remaining = &remaining[marker.len()..];
+        } else {
+            rendered.push_str("{{");
+            remaining = &remaining[2..];
+        }
+    }
+    rendered.push_str(remaining);
+    Bytes::from(rendered)
+}
+
+/// Append plain text escaped for HTML text and double-quoted attributes.
+fn push_html_escaped(rendered: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => rendered.push_str("&amp;"),
+            '<' => rendered.push_str("&lt;"),
+            '>' => rendered.push_str("&gt;"),
+            '"' => rendered.push_str("&quot;"),
+            '\'' => rendered.push_str("&#39;"),
+            _ => rendered.push(character),
+        }
     }
 }
 
@@ -332,6 +476,8 @@ pub enum ConfigError {
     /// Two `MBA_PASSWORD*` variables shared the same value, which would
     /// break independent revocation.
     DuplicatePassword,
+    /// A configured template-text override was not valid Unicode.
+    InvalidTemplateText { variable: String },
     /// `MBA_UPSTREAM` was unset or empty.
     MissingUpstream,
     /// `MBA_UPSTREAM` was set but is not an absolute HTTP(S) URL.
@@ -355,6 +501,9 @@ impl fmt::Display for ConfigError {
                 "two password variables share the same value; each password \
                  must be distinct to be revoked independently"
             ),
+            Self::InvalidTemplateText { variable } => {
+                write!(f, "`{variable}` must contain valid Unicode")
+            }
             Self::MissingUpstream => write!(f, "`{ENV_UPSTREAM}` must be set"),
             Self::InvalidUpstream { value, reason } => write!(
                 f,
@@ -373,9 +522,133 @@ mod tests {
 
     use super::*;
 
+    /// Build template text from explicit variables without mutating the
+    /// process-wide environment.
+    fn template_text_from_vars(vars: &[(&str, &str)]) -> TemplateText {
+        TemplateText::from_env(
+            vars.iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn valid_values_build_a_config() {
         assert!(Config::from_values("hunter2", "http://app:2001").is_ok());
+    }
+
+    #[test]
+    fn default_template_text_renders_the_existing_page_text() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.wall()).unwrap();
+
+        assert!(wall.contains("<html lang=\"en\">"));
+        assert!(wall.contains("<title>Welcome!</title>"));
+        assert!(wall.contains(">Password</label>"));
+        assert!(wall.contains("placeholder=\"Password\""));
+        assert!(wall.contains(">Enter</button>"));
+    }
+
+    #[test]
+    fn page_language_variable_overrides_the_default() {
+        let text = template_text_from_vars(&[(ENV_TEMPLATE_PAGE_LANGUAGE, "fr")]);
+        assert_eq!(text.page_language, "fr");
+    }
+
+    #[test]
+    fn page_title_variable_overrides_the_default() {
+        let text = template_text_from_vars(&[(ENV_TEMPLATE_PAGE_TITLE, "Mon site")]);
+        assert_eq!(text.page_title, "Mon site");
+    }
+
+    #[test]
+    fn password_label_variable_overrides_the_default() {
+        let text = template_text_from_vars(&[(ENV_TEMPLATE_PASSWORD_LABEL, "Mot de passe")]);
+        assert_eq!(text.password_label, "Mot de passe");
+    }
+
+    #[test]
+    fn password_placeholder_variable_overrides_the_default() {
+        let text = template_text_from_vars(&[(ENV_TEMPLATE_PASSWORD_PLACEHOLDER, "Secret")]);
+        assert_eq!(text.password_placeholder, "Secret");
+    }
+
+    #[test]
+    fn submit_button_text_variable_overrides_the_default() {
+        let text = template_text_from_vars(&[(ENV_TEMPLATE_SUBMIT_BUTTON_TEXT, "Entrer")]);
+        assert_eq!(text.submit_button_text, "Entrer");
+    }
+
+    #[test]
+    fn empty_template_text_variable_overrides_the_default() {
+        let text = template_text_from_vars(&[(ENV_TEMPLATE_PAGE_TITLE, "")]);
+        assert!(text.page_title.is_empty());
+    }
+
+    #[test]
+    fn unknown_template_variable_is_ignored() {
+        let text = template_text_from_vars(&[("MBA_TEMPLATE_FILE", "/tmp/wall.html")]);
+        assert_eq!(text.page_title, "Welcome!");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_template_text_is_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let result = TemplateText::from_env(
+            [(
+                OsString::from(ENV_TEMPLATE_PAGE_TITLE),
+                OsString::from_vec(vec![0xff]),
+            )]
+            .into_iter(),
+        );
+
+        let Err(error) = result else {
+            panic!("non-Unicode template text was accepted");
+        };
+        assert_matches!(
+            error,
+            ConfigError::InvalidTemplateText { variable }
+                if variable == ENV_TEMPLATE_PAGE_TITLE
+        );
+    }
+
+    #[test]
+    fn template_values_are_html_escaped() {
+        let text = TemplateText {
+            page_title: "&<>\"'".to_owned(),
+            ..TemplateText::default()
+        };
+
+        let rendered = render_template("{{PAGE_TITLE}}", &text);
+
+        assert_eq!(rendered, "&amp;&lt;&gt;&quot;&#39;");
+    }
+
+    #[test]
+    fn template_values_are_not_rendered_recursively() {
+        let text = TemplateText {
+            page_title: "{{SUBMIT_BUTTON_TEXT}}".to_owned(),
+            submit_button_text: "Submit".to_owned(),
+            ..TemplateText::default()
+        };
+
+        let rendered = render_template("{{PAGE_TITLE}}", &text);
+
+        assert_eq!(rendered, "{{SUBMIT_BUTTON_TEXT}}");
+    }
+
+    #[test]
+    fn template_without_known_markers_is_unchanged() {
+        let rendered = render_template("<p>{{UNKNOWN}}</p>", &TemplateText::default());
+        assert_eq!(rendered, "<p>{{UNKNOWN}}</p>");
+    }
+
+    #[test]
+    fn empty_template_is_valid() {
+        let rendered = render_template("", &TemplateText::default());
+        assert!(rendered.is_empty());
     }
 
     #[test]
