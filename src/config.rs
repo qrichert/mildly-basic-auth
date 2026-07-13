@@ -8,6 +8,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use axum::body::Bytes;
 use axum::http::Uri;
@@ -29,6 +30,9 @@ const ENV_PASSWORD: &str = "MBA_PASSWORD";
 /// it carries no meaning at request time. Reserved: future config must
 /// not land under `MBA_PASSWORD_*` or it would be read as a password.
 const ENV_PASSWORD_PREFIX: &str = "MBA_PASSWORD_";
+/// Environment variable holding an optional custom password-page template
+/// path. The file is read and rendered once at startup.
+const ENV_TEMPLATE_FILE: &str = "MBA_TEMPLATE_FILE";
 /// Environment variable overriding the password page's document language.
 const ENV_TEMPLATE_PAGE_LANGUAGE: &str = "MBA_TEMPLATE_PAGE_LANGUAGE";
 /// Environment variable overriding the password page's title.
@@ -74,16 +78,16 @@ pub struct Config {
 
 impl Config {
     /// Build from the process environment. Delegates to the same pure
-    /// validation as [`Config::from_values`] so tests do not have to mutate
-    /// process-wide env (which is `unsafe` in Rust 2024).
+    /// validation as [`Config::from_values`] so tests do not have to
+    /// mutate process-wide env (which is `unsafe` in Rust 2024).
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] if `MBA_ADDRESS` is not a valid non-zero IP
-    /// socket address, no `MBA_PASSWORD*` variable has a non-empty UTF-8
-    /// value, two of them share the same value, a template-text override is
-    /// not valid Unicode, or `MBA_UPSTREAM` is not a valid absolute HTTP(S)
-    /// URL.
+    /// Returns [`ConfigError`] if `MBA_ADDRESS` is not a valid non-zero
+    /// IP socket address, no `MBA_PASSWORD*` variable has a non-empty
+    /// UTF-8 value, two of them share the same value, a custom template
+    /// file is unusable, a template-text override is not valid Unicode,
+    /// or `MBA_UPSTREAM` is not a valid absolute HTTP(S) URL.
     pub fn from_env() -> Result<Self, ConfigError> {
         let address = match std::env::var(ENV_ADDRESS) {
             Ok(address) => address,
@@ -97,12 +101,15 @@ impl Config {
         };
         let passwords = passwords_from_env(std::env::vars_os());
         let passwords: Vec<&str> = passwords.iter().map(String::as_str).collect();
+        let custom_template = load_custom_template(std::env::var_os(ENV_TEMPLATE_FILE))?;
+        let template = custom_template.as_deref().unwrap_or(WALL_TEMPLATE);
         let template_text = TemplateText::from_env(std::env::vars_os())?;
         let upstream = std::env::var(ENV_UPSTREAM).unwrap_or_default();
-        Self::from_passwords_address_and_template_text(
+        Self::from_passwords_address_template_and_text(
             &passwords,
             &upstream,
             &address,
+            template,
             &template_text,
         )
     }
@@ -174,20 +181,22 @@ impl Config {
         upstream: &str,
         address: &str,
     ) -> Result<Self, ConfigError> {
-        Self::from_passwords_address_and_template_text(
+        Self::from_passwords_address_template_and_text(
             passwords,
             upstream,
             address,
+            WALL_TEMPLATE,
             &TemplateText::default(),
         )
     }
 
-    /// Build and validate the complete runtime configuration with explicit
-    /// password-page text.
-    fn from_passwords_address_and_template_text(
+    /// Build and validate the complete runtime configuration with an
+    /// explicit password-page template and text.
+    fn from_passwords_address_template_and_text(
         passwords: &[&str],
         upstream: &str,
         address: &str,
+        template: &str,
         template_text: &TemplateText,
     ) -> Result<Self, ConfigError> {
         // Keep non-empty values (drop unset/blank vars).
@@ -220,7 +229,7 @@ impl Config {
             bind_address: address,
             sessions,
             upstream,
-            wall: render_template(WALL_TEMPLATE, template_text),
+            wall: render_template(template, template_text),
         })
     }
 
@@ -299,6 +308,30 @@ impl Default for TemplateText {
             submit_button_text: "Enter".to_owned(),
         }
     }
+}
+
+/// Load an explicitly configured template, returning `None` when unset.
+/// Custom files must contain non-whitespace UTF-8 so a definite
+/// misconfiguration cannot turn the login page into an empty response.
+fn load_custom_template(path: Option<OsString>) -> Result<Option<String>, ConfigError> {
+    let Some(path) = path else { return Ok(None) };
+    let path = PathBuf::from(path);
+    let invalid = |reason: String| ConfigError::InvalidTemplateFile {
+        path: path.clone(),
+        reason,
+    };
+
+    if path.as_os_str().is_empty() {
+        return Err(invalid("path must not be empty".to_owned()));
+    }
+
+    let template = std::fs::read_to_string(&path).map_err(|error| invalid(error.to_string()))?;
+    if template.trim().is_empty() {
+        return Err(invalid(
+            "template must contain non-whitespace HTML".to_owned(),
+        ));
+    }
+    Ok(Some(template))
 }
 
 /// Render known markers from `template`, preserving unknown or absent
@@ -478,6 +511,8 @@ pub enum ConfigError {
     DuplicatePassword,
     /// A configured template-text override was not valid Unicode.
     InvalidTemplateText { variable: String },
+    /// `MBA_TEMPLATE_FILE` did not name a usable UTF-8 template.
+    InvalidTemplateFile { path: PathBuf, reason: String },
     /// `MBA_UPSTREAM` was unset or empty.
     MissingUpstream,
     /// `MBA_UPSTREAM` was set but is not an absolute HTTP(S) URL.
@@ -504,6 +539,11 @@ impl fmt::Display for ConfigError {
             Self::InvalidTemplateText { variable } => {
                 write!(f, "`{variable}` must contain valid Unicode")
             }
+            Self::InvalidTemplateFile { path, reason } => write!(
+                f,
+                "`{ENV_TEMPLATE_FILE}` is not a usable UTF-8 template ({reason}): \"{}\"",
+                path.display(),
+            ),
             Self::MissingUpstream => write!(f, "`{ENV_UPSTREAM}` must be set"),
             Self::InvalidUpstream { value, reason } => write!(
                 f,
@@ -519,8 +559,35 @@ impl Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    /// A uniquely named file removed when its test ends.
+    struct TemporaryTemplate {
+        path: PathBuf,
+    }
+
+    impl TemporaryTemplate {
+        /// Write `contents` to a new temporary template.
+        fn new(contents: &[u8]) -> Self {
+            static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
+
+            let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "mildly-basic-auth-config-test-{}-{sequence}",
+                std::process::id(),
+            ));
+            std::fs::write(&path, contents).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TemporaryTemplate {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 
     /// Build template text from explicit variables without mutating the
     /// process-wide environment.
@@ -547,6 +614,96 @@ mod tests {
         assert!(wall.contains(">Password</label>"));
         assert!(wall.contains("placeholder=\"Password\""));
         assert!(wall.contains(">Enter</button>"));
+    }
+
+    #[test]
+    fn unset_template_file_has_no_override() {
+        assert_eq!(load_custom_template(None).unwrap(), None);
+    }
+
+    #[test]
+    fn custom_template_file_is_loaded() {
+        let file = TemporaryTemplate::new(b"<p>{{PAGE_TITLE}}</p>");
+
+        let template = load_custom_template(Some(file.path.clone().into_os_string())).unwrap();
+
+        assert_eq!(template.as_deref(), Some("<p>{{PAGE_TITLE}}</p>"));
+    }
+
+    #[test]
+    fn explicit_template_uses_configured_text() {
+        let text = TemplateText {
+            page_title: "Custom title".to_owned(),
+            ..TemplateText::default()
+        };
+
+        let config = Config::from_passwords_address_template_and_text(
+            &["hunter2"],
+            "http://app:2001",
+            DEFAULT_BIND_ADDRESS,
+            "<title>{{PAGE_TITLE}}</title>",
+            &text,
+        )
+        .unwrap();
+
+        assert_eq!(config.wall(), "<title>Custom title</title>");
+    }
+
+    #[test]
+    fn empty_template_file_path_is_rejected() {
+        let result = load_custom_template(Some(OsString::new()));
+
+        assert_matches!(
+            result,
+            Err(ConfigError::InvalidTemplateFile { path, reason })
+                if path == PathBuf::new() && reason == "path must not be empty"
+        );
+    }
+
+    #[test]
+    fn missing_template_file_is_rejected() {
+        let file = TemporaryTemplate::new(b"temporary");
+        let path = file.path.clone();
+        std::fs::remove_file(&path).unwrap();
+
+        let result = load_custom_template(Some(path.clone().into_os_string()));
+
+        assert_matches!(
+            result,
+            Err(ConfigError::InvalidTemplateFile { path: error_path, .. })
+                if error_path == path
+        );
+    }
+
+    #[test]
+    fn non_utf8_template_file_is_rejected() {
+        let file = TemporaryTemplate::new(&[0xff]);
+
+        let result = load_custom_template(Some(file.path.clone().into_os_string()));
+
+        assert_matches!(result, Err(ConfigError::InvalidTemplateFile { .. }));
+    }
+
+    #[test]
+    fn empty_template_file_is_rejected() {
+        let file = TemporaryTemplate::new(b"");
+
+        let result = load_custom_template(Some(file.path.clone().into_os_string()));
+
+        assert_matches!(
+            result,
+            Err(ConfigError::InvalidTemplateFile { reason, .. })
+                if reason == "template must contain non-whitespace HTML"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_template_file_is_rejected() {
+        let file = TemporaryTemplate::new(b" \n\t");
+
+        let result = load_custom_template(Some(file.path.clone().into_os_string()));
+
+        assert_matches!(result, Err(ConfigError::InvalidTemplateFile { .. }));
     }
 
     #[test]
@@ -587,7 +744,7 @@ mod tests {
 
     #[test]
     fn unknown_template_variable_is_ignored() {
-        let text = template_text_from_vars(&[("MBA_TEMPLATE_FILE", "/tmp/wall.html")]);
+        let text = template_text_from_vars(&[(ENV_TEMPLATE_FILE, "/tmp/wall.html")]);
         assert_eq!(text.page_title, "Welcome!");
     }
 
@@ -646,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_template_is_valid() {
+    fn renderer_leaves_an_empty_template_empty() {
         let rendered = render_template("", &TemplateText::default());
         assert!(rendered.is_empty());
     }

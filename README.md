@@ -41,8 +41,8 @@ Redis. Drop the container in front of your app and it works.
 
 Everything else follows from that:
 
-- The login page is a single self-contained HTML file (inline CSS and
-  SVG, no external requests — the wall never phones home).
+- The built-in login page is a single self-contained HTML file (inline
+  CSS and SVG, no external requests — the wall never phones home).
 - Sessions are stateless. The cookie is a digest of the password used to
   log in, so there is nothing to persist, and rotating (or removing) a
   password invalidates only the sessions created with it — the others
@@ -200,6 +200,8 @@ non-root user (UID `10001`) on a Debian-slim image.[^debian]
 
 ### Template
 
+#### Text overrides
+
 The built-in password page can be translated or renamed without
 replacing its HTML:
 
@@ -227,9 +229,30 @@ that text. Values are inserted as text, not HTML, and are escaped before
 the page is served. A configured override that is not valid Unicode is a
 startup error.
 
+#### Full override
+
+Bind-mount a custom page and point `MBA_TEMPLATE_FILE` at it:
+
+```yaml
+environment:
+  MBA_TEMPLATE_FILE: /etc/mba/template.html
+volumes:
+  - ./template.html:/etc/mba/template.html:ro
+```
+
+Copy and adapt [`src/index.html`](src/index.html); its structure is not
+validated. The file must be non-empty UTF-8 readable by container UID
+`10001`. It is loaded once at startup, so changes require a restart.
+
+The text markers above also work in custom pages, but are escaped only
+for HTML text and quoted attributes—not JavaScript, CSS, or URLs. Custom
+HTML is public before authentication: keep it self-contained and never
+put secrets in it.
+
 ## Roadmap
 
-v0 is plain-passwords-in-env-vars with a fixed template. Planned next:
+v0 remains plain-passwords-in-environment-variables and deliberately
+small. Planned next:
 
 - **More auth methods:** pre-hashed passwords, and possibly a
   header-only bearer-token check. Pre-hashed passwords will be
@@ -241,10 +264,6 @@ v0 is plain-passwords-in-env-vars with a fixed template. Planned next:
   disclosure harmless.
 - **Config beyond env vars:** an env file or a YAML config file (via
   `MBA_CONFIG_FILE` or discovery).
-- **Custom template:** full override via `MBA_TEMPLATE_FILE` or a bind
-  mount to `/etc/template.html`, loaded at startup, with a template
-  engine to interpolate variables and conditionally render fields per
-  auth method.
 - **More settings:** auth method, logging on/off, session lifetime.
 - **Authentication hardening:** optional failed-login throttling, once
   trusted client-IP handling is configurable.

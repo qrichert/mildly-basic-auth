@@ -463,7 +463,7 @@ fn template_text_variables_customize_every_wall_response() {
         let address = available.local_addr().unwrap();
         drop(available);
 
-        let mut child = binary_without_passwords()
+        let mut child = binary_without_mba_environment()
             .env("MBA_ADDRESS", address.to_string())
             .env("MBA_PASSWORD", &password)
             .env("MBA_UPSTREAM", "http://127.0.0.1:9")
@@ -531,6 +531,91 @@ fn template_text_variables_customize_every_wall_response() {
     );
 }
 
+#[test]
+fn template_file_customizes_every_wall_response() {
+    let template = TemporaryTemplate::new(
+        b"<!doctype html><title>{{PAGE_TITLE}}</title><p>CUSTOM_TEMPLATE</p>",
+    );
+    let gate = TemplateGate::spawn(template.path(), PASSWORD);
+
+    let get_response = gate.get();
+    let post_response = gate.post_password("wrong", "/");
+
+    assert!(get_response.starts_with("HTTP/1.1 401 Unauthorized"));
+    assert!(post_response.starts_with("HTTP/1.1 401 Unauthorized"));
+    let get_body = response_body(&get_response);
+    let post_body = response_body(&post_response);
+    assert_eq!(get_body, post_body);
+    assert!(get_body.contains("<title>Welcome!</title>"));
+    assert!(get_body.contains("CUSTOM_TEMPLATE"));
+    assert!(!get_body.contains("{{PAGE_TITLE}}"));
+}
+
+#[test]
+fn password_field_authenticates_with_a_custom_template_configured() {
+    let template = TemporaryTemplate::new(b"<p>CUSTOM_TEMPLATE</p>");
+    let gate = TemplateGate::spawn(template.path(), PASSWORD);
+
+    let response = gate.post_password(PASSWORD, "/private?section=docs");
+
+    assert!(response.starts_with("HTTP/1.1 303 See Other"));
+    assert!(response.contains("location: /private?section=docs"));
+    assert!(response.contains(&format!("set-cookie: mba={}", valid_token())));
+}
+
+#[test]
+fn template_file_is_loaded_only_at_startup() {
+    let template = TemporaryTemplate::new(b"<p>VERSION_ONE</p>");
+    let gate = TemplateGate::spawn(template.path(), PASSWORD);
+
+    template.overwrite(b"<p>VERSION_TWO</p>");
+    let changed_response = gate.get();
+    assert!(response_body(&changed_response).contains("VERSION_ONE"));
+    assert!(!response_body(&changed_response).contains("VERSION_TWO"));
+
+    template.remove();
+    let removed_response = gate.get();
+    assert!(response_body(&removed_response).contains("VERSION_ONE"));
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_template_file_path_is_supported() {
+    // Skip where the filesystem can't hold a non-Unicode name (e.g.,
+    // APFS on macOS enforces UTF-8): there is no such path to exercise.
+    let Some(template) = TemporaryTemplate::with_non_unicode_name(b"<p>NON_UNICODE_PATH</p>")
+    else {
+        return;
+    };
+    let gate = TemplateGate::spawn(template.path(), PASSWORD);
+
+    let response = gate.get();
+
+    assert!(response_body(&response).contains("NON_UNICODE_PATH"));
+}
+
+#[test]
+fn missing_template_file_fails_fast() {
+    let template = TemporaryTemplate::new(b"temporary");
+    let path = template.path().to_owned();
+    template.remove();
+
+    let output = binary_without_mba_environment()
+        .env("MBA_PASSWORD", PASSWORD)
+        .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+        .env("MBA_TEMPLATE_FILE", &path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("MBA_TEMPLATE_FILE"), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&path.to_string_lossy().into_owned()),
+        "stderr: {stderr}"
+    );
+}
+
 /// Send one blocking request to a child-process gate, returning its full
 /// response when the listener is available.
 fn blocking_request(address: std::net::SocketAddr, request: &str) -> Option<String> {
@@ -547,22 +632,177 @@ fn blocking_request(address: std::net::SocketAddr, request: &str) -> Option<Stri
     Some(String::from_utf8_lossy(&response).into_owned())
 }
 
+/// The response body after the HTTP header block.
+fn response_body(response: &str) -> &str {
+    response.split_once("\r\n\r\n").unwrap().1
+}
+
+/// A custom template file removed when its test ends.
+struct TemporaryTemplate {
+    path: std::path::PathBuf,
+}
+
+impl TemporaryTemplate {
+    /// Write `contents` to a uniquely named temporary template.
+    fn new(contents: &[u8]) -> Self {
+        let path = std::env::temp_dir().join(unique_template_name());
+        Self::write_new(path, contents)
+    }
+
+    /// Write a template whose path is not valid Unicode, if the
+    /// filesystem accepts such a name.
+    ///
+    /// Returns `None` where the filesystem enforces UTF-8 names (e.g.,
+    /// APFS on macOS rejects the trailing `0xff` byte with `EILSEQ`),
+    /// letting callers skip rather than fail on a fixture the platform
+    /// cannot represent.
+    #[cfg(unix)]
+    fn with_non_unicode_name(contents: &[u8]) -> Option<Self> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut name = unique_template_name().into_bytes();
+        name.push(0xff);
+        let path = std::env::temp_dir().join(std::ffi::OsString::from_vec(name));
+        // Not `write_new`: this write is expected to fail where the
+        // filesystem rejects non-Unicode names, so we skip instead of
+        // panicking.
+        std::fs::write(&path, contents).ok()?;
+        Some(Self { path })
+    }
+
+    /// Write the initial contents at `path`.
+    fn write_new(path: std::path::PathBuf, contents: &[u8]) -> Self {
+        std::fs::write(&path, contents).unwrap();
+        Self { path }
+    }
+
+    /// Filesystem path passed to `MBA_TEMPLATE_FILE`.
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Replace the template source after the service has started.
+    fn overwrite(&self, contents: &[u8]) {
+        std::fs::write(&self.path, contents).unwrap();
+    }
+
+    /// Remove the template source after the service has started.
+    fn remove(&self) {
+        std::fs::remove_file(&self.path).unwrap();
+    }
+}
+
+impl Drop for TemporaryTemplate {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A unique filename for child-process template tests.
+fn unique_template_name() -> String {
+    static NEXT_TEMPLATE: AtomicUsize = AtomicUsize::new(0);
+
+    let sequence = NEXT_TEMPLATE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "mildly-basic-auth-integration-test-{}-{sequence}",
+        std::process::id(),
+    )
+}
+
+/// A child-process gate configured with a custom template.
+struct TemplateGate {
+    address: std::net::SocketAddr,
+    child: std::process::Child,
+}
+
+impl TemplateGate {
+    /// Start the binary and wait until it serves the custom wall.
+    fn spawn(template_path: &std::path::Path, password: &str) -> Self {
+        let mut failures = Vec::new();
+
+        // Retry if another process wins the allocation-to-bind gap.
+        for _ in 0..5 {
+            let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = available.local_addr().unwrap();
+            drop(available);
+
+            let mut child = binary_without_mba_environment()
+                .env("MBA_ADDRESS", address.to_string())
+                .env("MBA_PASSWORD", password)
+                .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+                .env("MBA_TEMPLATE_FILE", template_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if blocking_request(address, &Self::get_request(address))
+                    .is_some_and(|response| response.starts_with("HTTP/1.1 401 Unauthorized"))
+                {
+                    return Self { address, child };
+                }
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            failures.push(format!(
+                "`{address}`: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        panic!(
+            "service did not serve the custom template after five attempts:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Request the configured wall.
+    fn get(&self) -> String {
+        blocking_request(self.address, &Self::get_request(self.address)).unwrap()
+    }
+
+    /// Submit a form-encoded `password` field to `target`.
+    fn post_password(&self, password: &str, target: &str) -> String {
+        let body = login_body(password);
+        let request = format!(
+            "POST {target} HTTP/1.1\r\nHost: {}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.address,
+            body.len(),
+        );
+        blocking_request(self.address, &request).unwrap()
+    }
+
+    /// HTTP request used to wait for and retrieve the wall.
+    fn get_request(address: std::net::SocketAddr) -> String {
+        format!("GET / HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+    }
+}
+
+impl Drop for TemplateGate {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 // --- Fail-fast startup (child process) -----------------------------------
 
-/// Command for the binary with every `MBA_PASSWORD*` variable removed, so
-/// the child sees only the passwords a test sets explicitly. Every
-/// child-process test must start from this: a child inherits the parent
-/// environment, so a stray `MBA_PASSWORD_*` there could otherwise (a) start
-/// a "no password" test and make `.output()` block forever, or (b) collide
-/// with a test's own password and trip `DuplicatePassword` before the
-/// validation the test is actually checking.
-fn binary_without_passwords() -> std::process::Command {
+/// Command for the binary with every inherited `MBA_*` variable removed.
+/// Every child-process test must start here so ambient configuration cannot
+/// change the behavior or startup error the test is exercising.
+fn binary_without_mba_environment() -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_mildly-basic-auth"));
     for (name, _) in std::env::vars_os() {
-        if name
-            .to_str()
-            .is_some_and(|n| n == "MBA_PASSWORD" || n.starts_with("MBA_PASSWORD_"))
-        {
+        if name.to_str().is_some_and(|name| name.starts_with("MBA_")) {
             command.env_remove(name);
         }
     }
@@ -571,7 +811,7 @@ fn binary_without_passwords() -> std::process::Command {
 
 #[test]
 fn missing_password_fails_fast() {
-    let output = binary_without_passwords()
+    let output = binary_without_mba_environment()
         .env_remove("MBA_ADDRESS")
         .env("MBA_UPSTREAM", "http://127.0.0.1:9")
         .output()
@@ -584,7 +824,7 @@ fn missing_password_fails_fast() {
 
 #[test]
 fn missing_upstream_fails_fast() {
-    let output = binary_without_passwords()
+    let output = binary_without_mba_environment()
         .env_remove("MBA_ADDRESS")
         .env("MBA_PASSWORD", PASSWORD)
         .env_remove("MBA_UPSTREAM")
@@ -598,7 +838,7 @@ fn missing_upstream_fails_fast() {
 
 #[test]
 fn invalid_address_fails_fast() {
-    let output = binary_without_passwords()
+    let output = binary_without_mba_environment()
         .env("MBA_ADDRESS", "localhost:4630")
         .env("MBA_PASSWORD", PASSWORD)
         .env("MBA_UPSTREAM", "http://127.0.0.1:9")
@@ -624,7 +864,7 @@ fn custom_address_is_bound() {
         let address = available.local_addr().unwrap();
         drop(available);
 
-        let mut child = binary_without_passwords()
+        let mut child = binary_without_mba_environment()
             .env("MBA_ADDRESS", address.to_string())
             .env("MBA_PASSWORD", &password)
             .env("MBA_UPSTREAM", "http://127.0.0.1:9")
@@ -680,7 +920,7 @@ fn suffixed_password_variables_each_authenticate() {
         let address = available.local_addr().unwrap();
         drop(available);
 
-        let mut child = binary_without_passwords()
+        let mut child = binary_without_mba_environment()
             .env("MBA_ADDRESS", address.to_string())
             .env("MBA_PASSWORD_ALICE", &alice)
             .env("MBA_PASSWORD_BOB", &bob)
