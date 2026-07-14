@@ -200,18 +200,19 @@ non-root user (UID `10001`) on a Debian-slim image.[^debian]
 
 ### Template
 
+| Variable                            | Default       | Description                               |
+| ----------------------------------- | ------------- | ----------------------------------------- |
+| `MBA_TEMPLATE_FILE`                 | Built-in page | Path to custom password-page HTML.        |
+| `MBA_TEMPLATE_PAGE_LANGUAGE`        | `en`          | Document language used by assistive tech. |
+| `MBA_TEMPLATE_PAGE_TITLE`           | `Welcome!`    | Browser tab title.                        |
+| `MBA_TEMPLATE_PASSWORD_LABEL`       | `Password`    | Accessible password-field label.          |
+| `MBA_TEMPLATE_PASSWORD_PLACEHOLDER` | `Password`    | Visible password-field placeholder.       |
+| `MBA_TEMPLATE_SUBMIT_BUTTON_TEXT`   | `Enter`       | Submit-button text.                       |
+
 #### Text overrides
 
 The built-in password page can be translated or renamed without
-replacing its HTML:
-
-| Variable                            | Default    | Description                               |
-| ----------------------------------- | ---------- | ----------------------------------------- |
-| `MBA_TEMPLATE_PAGE_LANGUAGE`        | `en`       | Document language used by assistive tech. |
-| `MBA_TEMPLATE_PAGE_TITLE`           | `Welcome!` | Browser tab title.                        |
-| `MBA_TEMPLATE_PASSWORD_LABEL`       | `Password` | Accessible password-field label.          |
-| `MBA_TEMPLATE_PASSWORD_PLACEHOLDER` | `Password` | Visible password-field placeholder.       |
-| `MBA_TEMPLATE_SUBMIT_BUTTON_TEXT`   | `Enter`    | Submit-button text.                       |
+replacing its HTML.
 
 For example:
 
