@@ -585,7 +585,7 @@ mod tests {
 
     impl Drop for TemporaryTemplate {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
+            _ = std::fs::remove_file(&self.path);
         }
     }
 

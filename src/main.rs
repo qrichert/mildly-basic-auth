@@ -41,7 +41,7 @@ async fn main() -> ExitCode {
         let mut stdout = std::io::stdout().lock();
         let result = writeln!(stdout, "Listening on {address}.").and_then(|()| stdout.flush());
         if let Err(error) = result {
-            let _ = writeln!(
+            _ = writeln!(
                 std::io::stderr(),
                 "warning: could not write startup announcement: {error}"
             );

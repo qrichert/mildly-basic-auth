@@ -504,7 +504,7 @@ fn template_text_variables_customize_every_wall_response() {
             blocking_request(address, &request)
         });
 
-        let _ = child.kill();
+        _ = child.kill();
         let output = child.wait_with_output().unwrap();
 
         if let (Some(get_response), Some(post_response)) = (get_response, post_response) {
@@ -694,7 +694,7 @@ impl TemporaryTemplate {
 
 impl Drop for TemporaryTemplate {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -749,7 +749,7 @@ impl TemplateGate {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
-            let _ = child.kill();
+            _ = child.kill();
             let output = child.wait_with_output().unwrap();
             failures.push(format!(
                 "`{address}`: {}",
@@ -789,8 +789,8 @@ impl TemplateGate {
 
 impl Drop for TemplateGate {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        _ = self.child.kill();
+        _ = self.child.wait();
     }
 }
 
@@ -886,7 +886,7 @@ fn custom_address_is_bound() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let _ = child.kill();
+        _ = child.kill();
         let output = child.wait_with_output().unwrap();
         if is_serving {
             return;
@@ -953,7 +953,7 @@ fn suffixed_password_variables_each_authenticate() {
             )
         });
 
-        let _ = child.kill();
+        _ = child.kill();
         let output = child.wait_with_output().unwrap();
 
         if let Some((alice_ok, bob_ok, wrong_rejected)) = outcome {
@@ -1003,7 +1003,7 @@ fn authenticates_at(address: std::net::SocketAddr, password: &str) -> bool {
     }
 
     let mut response = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut stream, &mut response);
+    _ = std::io::Read::read_to_end(&mut stream, &mut response);
     let response = String::from_utf8_lossy(&response);
     let token = blake3::hash(password.as_bytes()).to_hex();
     response.starts_with("HTTP/1.1 303 See Other")
@@ -1045,7 +1045,7 @@ fn startup_announces_it_is_listening() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let _ = child.kill();
+        _ = child.kill();
         let output = child.wait_with_output().unwrap();
         if is_serving {
             // Printed before `serve`, so it is on stdout by the time
@@ -1105,7 +1105,7 @@ fn startup_announcement_write_failure_does_not_crash() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let _ = child.kill();
+        _ = child.kill();
         let output = child.wait_with_output().unwrap();
         if is_serving {
             // The fallible write must have failed and warned, not
@@ -1170,8 +1170,8 @@ fn startup_announcement_survives_broken_stdout_and_stderr() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let _ = child.kill();
-        let _ = child.wait();
+        _ = child.kill();
+        _ = child.wait();
         if is_serving {
             return;
         }
