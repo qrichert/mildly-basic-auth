@@ -8,6 +8,7 @@
 // outside our control.
 #![allow(clippy::multiple_crate_versions)]
 
+use std::io::Write;
 use std::process::ExitCode;
 
 use mildly_basic_auth::{Config, build_app};
@@ -30,6 +31,22 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Startup announcement. A closed stdout must not kill a server
+    // that already bound, so write fallibly (unlike `println!`) and
+    // flush so the line reaches `docker logs` / a pipe promptly. The
+    // fallback warning is best-effort too: if stderr is also broken,
+    // drop it rather than panic.
+    {
+        let mut stdout = std::io::stdout().lock();
+        let result = writeln!(stdout, "Listening on {address}.").and_then(|()| stdout.flush());
+        if let Err(error) = result {
+            let _ = writeln!(
+                std::io::stderr(),
+                "warning: could not write startup announcement: {error}"
+            );
+        }
+    }
 
     if let Err(error) = axum::serve(listener, build_app(config)).await {
         eprintln!("error: server failed: {error}");

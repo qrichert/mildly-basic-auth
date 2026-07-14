@@ -1009,3 +1009,177 @@ fn authenticates_at(address: std::net::SocketAddr, password: &str) -> bool {
     response.starts_with("HTTP/1.1 303 See Other")
         && response.contains(&format!("set-cookie: mba={token}"))
 }
+
+#[test]
+fn startup_announces_it_is_listening() {
+    // A per-process password so a port-race squatter answering `401`
+    // cannot masquerade as this child; retry the whole attempt if we
+    // lose the allocation-to-bind gap.
+    let password = format!("startup-announce-test-{}", std::process::id());
+    let mut failures = Vec::new();
+
+    for _ in 0..5 {
+        let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = available.local_addr().unwrap();
+        drop(available);
+
+        let mut child = binary_without_mba_environment()
+            .env("MBA_ADDRESS", address.to_string())
+            .env("MBA_PASSWORD", &password)
+            .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut is_serving = false;
+        while std::time::Instant::now() < deadline {
+            if authenticates_at(address, &password) {
+                is_serving = true;
+                break;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        if is_serving {
+            // Printed before `serve`, so it is on stdout by the time
+            // the child authenticates.
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(stdout, format!("Listening on {address}.\n"));
+            return;
+        }
+        failures.push(format!(
+            "`{address}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    panic!(
+        "service did not announce itself after five attempts:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn startup_announcement_write_failure_does_not_crash() {
+    let password = format!("startup-announce-epipe-test-{}", std::process::id());
+    let mut failures = Vec::new();
+
+    for _ in 0..5 {
+        let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = available.local_addr().unwrap();
+        drop(available);
+
+        // Pre-broken pipe: close the read end before the child runs so
+        // its announcement write fails with `EPIPE` (deterministic, no
+        // spawn/write race). Rust ignores `SIGPIPE`, so the write
+        // returns `Err` instead of killing the process.
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+
+        let mut child = binary_without_mba_environment()
+            .env("MBA_ADDRESS", address.to_string())
+            .env("MBA_PASSWORD", &password)
+            .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut is_serving = false;
+        while std::time::Instant::now() < deadline {
+            if authenticates_at(address, &password) {
+                is_serving = true;
+                break;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        if is_serving {
+            // The fallible write must have failed and warned, not
+            // panicked the process.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("warning: could not write startup announcement"),
+                "stderr: {stderr}"
+            );
+            return;
+        }
+        failures.push(format!(
+            "`{address}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    panic!(
+        "service did not survive a failed announcement after five attempts:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn startup_announcement_survives_broken_stdout_and_stderr() {
+    let password = format!("startup-announce-noio-test-{}", std::process::id());
+    let mut failures = Vec::new();
+
+    for _ in 0..5 {
+        let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = available.local_addr().unwrap();
+        drop(available);
+
+        // Pre-break both pipes: when the announcement write fails and the
+        // fallback stderr warning would fail too, the server must keep
+        // serving — a courtesy line must never kill an already-bound
+        // process. A `println!`/`eprintln!` pair would panic here.
+        let (stdout_reader, stdout_writer) = std::io::pipe().unwrap();
+        drop(stdout_reader);
+        let (stderr_reader, stderr_writer) = std::io::pipe().unwrap();
+        drop(stderr_reader);
+
+        let mut child = binary_without_mba_environment()
+            .env("MBA_ADDRESS", address.to_string())
+            .env("MBA_PASSWORD", &password)
+            .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+            .stdout(stdout_writer)
+            .stderr(stderr_writer)
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut is_serving = false;
+        while std::time::Instant::now() < deadline {
+            if authenticates_at(address, &password) {
+                is_serving = true;
+                break;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        if is_serving {
+            return;
+        }
+        failures.push(format!("`{address}`: child did not survive"));
+    }
+
+    panic!(
+        "service did not survive broken stdout+stderr after five attempts:\n{}",
+        failures.join("\n")
+    );
+}
