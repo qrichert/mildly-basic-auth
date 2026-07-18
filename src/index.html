@@ -19,6 +19,7 @@
         --border: oklch(0.92 0.004 286.32);
         --input: oklch(0.92 0.004 286.32);
         --ring: oklch(0.705 0.015 286.067);
+        --destructive: oklch(0.577 0.245 27.325);
         --radius: 0.625rem;
       }
 
@@ -32,6 +33,7 @@
           --border: oklch(1 0 0 / 10%);
           --input: oklch(1 0 0 / 15%);
           --ring: oklch(0.552 0.016 285.938);
+          --destructive: oklch(0.704 0.191 22.216);
         }
       }
 
@@ -97,6 +99,11 @@
         gap: 1.5rem;
       }
 
+      .field {
+        /* Positioning context for the absolutely-placed status icon. */
+        position: relative;
+      }
+
       .input {
         display: flex;
         width: 100%;
@@ -124,6 +131,49 @@
       .input:focus-visible {
         border-color: var(--ring);
         box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring), transparent 50%);
+      }
+
+      /*
+        Trailing alert icon. Absolute + hidden by default, so revealing
+        it on the error wall shifts no layout: the button never moves.
+      */
+      .alert {
+        position: absolute;
+        inset-inline-end: 0.75rem;
+        top: 50%;
+        width: 1.25rem;
+        height: 1.25rem;
+        transform: translateY(-50%);
+        display: none;
+        color: var(--destructive);
+        pointer-events: none; /* Clicks fall through to the input. */
+      }
+
+      .input[aria-invalid="true"] {
+        /*
+          Reserve room so masked text can't slide under the icon. Scoped
+          to the invalid state; content is left-aligned, so the normal
+          wall is visually untouched.
+        */
+        padding-inline-end: 2.5rem;
+        border-color: var(--destructive);
+      }
+
+      .input[aria-invalid="true"] + .alert {
+        display: block;
+      }
+
+      /*
+        Keep the invalid identity while retyping, instead of the neutral
+        focus ring taking over. Same 50%-transparent ring as the neutral
+        `.input:focus-visible`, for visual consistency. The ring is a
+        soft outline; the full-contrast signal is the opaque red border
+        (plus the alert icon), so the translucent ring is fine.
+      */
+      .input[aria-invalid="true"]:focus-visible {
+        border-color: var(--destructive);
+        box-shadow: 0 0 0 3px
+          color-mix(in oklch, var(--destructive), transparent 50%);
       }
 
       .button {
@@ -231,16 +281,62 @@
           <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
         </svg>
         <form class="form" method="post">
-          <label class="sr-only" for="password">{{PASSWORD_LABEL}}</label>
-          <input
-            class="input"
-            id="password"
-            type="password"
-            name="password"
-            placeholder="{{PASSWORD_PLACEHOLDER}}"
-            autocomplete="current-password"
-            required
-          />
+          <div class="field">
+            <label class="sr-only" for="password">{{PASSWORD_LABEL}}</label>
+            <!--
+              These are filled per login state (markers are documented
+              by effect, not spelled out, so they are not themselves
+              substituted into this shipped comment): `aria-invalid` is
+              `true`/`false`, the error text (from
+              `MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE`) is empty until a
+              failed login, and the bare autofocus marker below renders
+              the `autofocus` attribute only on the failed-login page.
+              Keep that marker standalone — never quote it as an
+              attribute value: an empty boolean attribute is still "true",
+              so it would autofocus every page.
+            -->
+            <input
+              class="input"
+              id="password"
+              type="password"
+              name="password"
+              placeholder="{{PASSWORD_PLACEHOLDER}}"
+              autocomplete="current-password"
+              aria-describedby="password-error"
+              aria-invalid="{{IS_PASSWORD_INVALID}}"
+              {{PASSWORD_AUTOFOCUS}}
+              required
+            />
+            <!--
+              Trailing alert icon, revealed via CSS only when the input
+              is `aria-invalid="true"`. `aria-hidden` because its meaning
+              is carried in text by `#password-error` below.
+            -->
+            <!-- Alert icon from Lucide (https://lucide.dev/icons/circle-alert), ISC license. -->
+            <svg
+              class="alert"
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" x2="12" y1="8" y2="12"></line>
+              <line x1="12" x2="12.01" y1="16" y2="16"></line>
+            </svg>
+            <!--
+              Failed-login text, exposed to assistive tech via
+              `aria-describedby` above. Empty on the normal wall, so no
+              description and nothing is announced.
+            -->
+            <span class="sr-only" id="password-error"
+              >{{WRONG_PASSWORD_MESSAGE}}</span
+            >
+          </div>
           <button class="button" type="submit">{{SUBMIT_BUTTON_TEXT}}</button>
         </form>
       </div>

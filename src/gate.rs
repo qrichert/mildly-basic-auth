@@ -52,7 +52,14 @@ pub(crate) async fn gate(State(config): State<Config>, request: Request, next: N
     }
 
     if parts.method == Method::POST {
-        return handle_login(&parts, body, config.sessions(), config.wall()).await;
+        return handle_login(
+            &parts,
+            body,
+            config.sessions(),
+            config.wall(),
+            config.wrong_password_wall(),
+        )
+        .await;
     }
 
     wall_response(config.wall().clone())
@@ -71,18 +78,33 @@ fn sanitize_request_headers(parts: &mut Parts, cookies: &[CookiePair]) {
     rewrite_forwarding_headers(&mut parts.headers, authority);
 }
 
-/// Handle an unauthenticated `POST`: verify the submitted password and
-/// either start a session or re-serve the wall. The body is capped and
-/// never forwarded upstream.
-async fn handle_login(parts: &Parts, body: Body, sessions: &[Hash], wall: &Bytes) -> Response {
+/// Handle an unauthenticated `POST`. A submitted password that matches
+/// starts a session; one that matches nothing gets the failed-login
+/// `wrong_password_wall`. A `POST` with no `password` field is not a login
+/// attempt (e.g. a protected form submitted after its session expired), so
+/// it gets the neutral `wall` — not the failed-login state. The body is
+/// capped and never forwarded upstream.
+async fn handle_login(
+    parts: &Parts,
+    body: Body,
+    sessions: &[Hash],
+    wall: &Bytes,
+    wrong_password_wall: &Bytes,
+) -> Response {
     let Ok(bytes) = to_bytes(body, MAX_LOGIN_BODY).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
-    // Hand `login_success` the digest that actually matched, so the cookie
-    // carries a token that will authenticate on the follow-up request.
-    match extract_submitted_password(&bytes).and_then(|p| matching_session(&p, sessions).copied()) {
-        Some(session) => login_success(parts, &session),
+    match extract_submitted_password(&bytes) {
+        // No `password` field: not a login attempt, so keep the neutral
+        // wall instead of falsely showing the failed-login state.
         None => wall_response(wall.clone()),
+        Some(password) => match matching_session(&password, sessions) {
+            // Hand `login_success` the digest that actually matched, so the
+            // cookie carries a token that authenticates on the follow-up.
+            Some(session) => login_success(parts, session),
+            // A password was submitted but matched nothing: failed login.
+            None => wall_response(wrong_password_wall.clone()),
+        },
     }
 }
 

@@ -133,7 +133,10 @@ async fn unauthenticated_get_serves_the_wall() {
         "text/html; charset=utf-8"
     );
     assert!(resp.headers().get("www-authenticate").is_none());
-    assert!(resp.text().await.unwrap().contains("</form>"));
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("</form>"));
+    assert!(body.contains("aria-invalid=\"false\""));
+    assert!(!body.contains("Wrong password."));
     assert_eq!(h.upstream.hits(), 0);
 }
 
@@ -150,6 +153,31 @@ async fn wrong_password_serves_the_wall() {
         .unwrap();
 
     assert_eq!(resp.status(), 401);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("aria-invalid=\"true\""));
+    assert!(body.contains("Wrong password."));
+    assert_eq!(h.upstream.hits(), 0);
+}
+
+#[tokio::test]
+async fn password_less_post_serves_the_neutral_wall() {
+    // A POST without a `password` field is not a login attempt (e.g. a
+    // protected form submitted after its session expired), so it must get
+    // the neutral wall, not the failed-login state.
+    let h = spawn().await;
+    let resp = h
+        .client
+        .post(&h.base)
+        .header("content-type", FORM)
+        .body("comment=hello")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("aria-invalid=\"false\""));
+    assert!(!body.contains("Wrong password."));
     assert_eq!(h.upstream.hits(), 0);
 }
 
@@ -452,7 +480,7 @@ async fn raw_request(authority: &str, request: &str) -> String {
 }
 
 #[test]
-fn template_text_variables_customize_every_wall_response() {
+fn template_text_variables_customize_wall_responses() {
     let password = format!("template-text-test-{}", std::process::id());
     let mut failures = Vec::new();
 
@@ -470,7 +498,11 @@ fn template_text_variables_customize_every_wall_response() {
             .env("MBA_TEMPLATE_PAGE_LANGUAGE", "fr")
             .env("MBA_TEMPLATE_PAGE_TITLE", "Mon site")
             .env("MBA_TEMPLATE_PASSWORD_LABEL", "Mot de passe")
-            .env("MBA_TEMPLATE_PASSWORD_PLACEHOLDER", "Votre mot de passe")
+            .env("MBA_TEMPLATE_PASSWORD_PLACEHOLDER", "mot de passe")
+            .env(
+                "MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE",
+                "Mot de passe incorrect.",
+            )
             .env("MBA_TEMPLATE_SUBMIT_BUTTON_TEXT", "Entrer")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -511,11 +543,12 @@ fn template_text_variables_customize_every_wall_response() {
             assert!(post_response.starts_with("HTTP/1.1 401 Unauthorized"));
             let get_body = get_response.split_once("\r\n\r\n").unwrap().1;
             let post_body = post_response.split_once("\r\n\r\n").unwrap().1;
-            assert_eq!(get_body, post_body);
+            assert!(!get_body.contains("Mot de passe incorrect."));
+            assert!(post_body.contains("Mot de passe incorrect."));
             assert!(get_body.contains("<html lang=\"fr\">"));
             assert!(get_body.contains("<title>Mon site</title>"));
             assert!(get_body.contains(">Mot de passe</label>"));
-            assert!(get_body.contains("placeholder=\"Votre mot de passe\""));
+            assert!(get_body.contains("placeholder=\"mot de passe\""));
             assert!(get_body.contains(">Entrer</button>"));
             return;
         }

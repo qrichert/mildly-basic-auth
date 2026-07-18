@@ -31,7 +31,7 @@ const ENV_PASSWORD: &str = "MBA_PASSWORD";
 /// not land under `MBA_PASSWORD_*` or it would be read as a password.
 const ENV_PASSWORD_PREFIX: &str = "MBA_PASSWORD_";
 /// Environment variable holding an optional custom password-page template
-/// path. The file is read and rendered once at startup.
+/// path. The file is read once and both login states render at startup.
 const ENV_TEMPLATE_FILE: &str = "MBA_TEMPLATE_FILE";
 /// Environment variable overriding the password page's document language.
 const ENV_TEMPLATE_PAGE_LANGUAGE: &str = "MBA_TEMPLATE_PAGE_LANGUAGE";
@@ -41,6 +41,12 @@ const ENV_TEMPLATE_PAGE_TITLE: &str = "MBA_TEMPLATE_PAGE_TITLE";
 const ENV_TEMPLATE_PASSWORD_LABEL: &str = "MBA_TEMPLATE_PASSWORD_LABEL";
 /// Environment variable overriding the password field's placeholder.
 const ENV_TEMPLATE_PASSWORD_PLACEHOLDER: &str = "MBA_TEMPLATE_PASSWORD_PLACEHOLDER";
+/// Environment variable overriding the failed-login message. In the
+/// built-in page it is announced to assistive technologies only and not
+/// shown visually (sighted users see the invalid-field icon and red
+/// border); a custom template may render `{{WRONG_PASSWORD_MESSAGE}}`
+/// wherever it likes.
+const ENV_TEMPLATE_WRONG_PASSWORD_MESSAGE: &str = "MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE";
 /// Environment variable overriding the submit button's text.
 const ENV_TEMPLATE_SUBMIT_BUTTON_TEXT: &str = "MBA_TEMPLATE_SUBMIT_BUTTON_TEXT";
 /// Environment variable holding the upstream URL (required, absolute
@@ -71,9 +77,12 @@ pub struct Config {
     /// `S: Into<String>` for both arguments; a `&Uri` would not satisfy
     /// that bound.
     upstream: String,
-    /// Password page rendered once at startup. `Bytes` keeps per-response
-    /// and per-state clones cheap despite the page's size.
+    /// Password page rendered once at startup without a login error.
+    /// `Bytes` keeps per-response and per-state clones cheap despite the
+    /// page's size.
     wall: Bytes,
+    /// The same password-page template rendered with a failed-login error.
+    wrong_password_wall: Bytes,
 }
 
 impl Config {
@@ -225,11 +234,14 @@ impl Config {
             .collect();
         let upstream = validate_upstream(upstream)?;
         let address = validate_address(address)?;
+        let wall = render_template(template, template_text, false);
+        let wrong_password_wall = render_template(template, template_text, true);
         Ok(Self {
             bind_address: address,
             sessions,
             upstream,
-            wall: render_template(template, template_text),
+            wall,
+            wrong_password_wall,
         })
     }
 
@@ -248,6 +260,11 @@ impl Config {
     pub(crate) fn wall(&self) -> &Bytes {
         &self.wall
     }
+
+    /// Rendered password page with the failed-login state visible.
+    pub(crate) fn wrong_password_wall(&self) -> &Bytes {
+        &self.wrong_password_wall
+    }
 }
 
 impl fmt::Debug for Config {
@@ -259,6 +276,7 @@ impl fmt::Debug for Config {
             .field("sessions", &"<redacted>")
             .field("upstream", &self.upstream)
             .field("wall", &"<rendered HTML>")
+            .field("wrong_password_wall", &"<rendered HTML>")
             .finish()
     }
 }
@@ -269,6 +287,7 @@ struct TemplateText {
     page_title: String,
     password_label: String,
     password_placeholder: String,
+    wrong_password_message: String,
     submit_button_text: String,
 }
 
@@ -285,6 +304,7 @@ impl TemplateText {
                 ENV_TEMPLATE_PAGE_TITLE => &mut text.page_title,
                 ENV_TEMPLATE_PASSWORD_LABEL => &mut text.password_label,
                 ENV_TEMPLATE_PASSWORD_PLACEHOLDER => &mut text.password_placeholder,
+                ENV_TEMPLATE_WRONG_PASSWORD_MESSAGE => &mut text.wrong_password_message,
                 ENV_TEMPLATE_SUBMIT_BUTTON_TEXT => &mut text.submit_button_text,
                 _ => continue,
             };
@@ -304,7 +324,8 @@ impl Default for TemplateText {
             page_language: "en".to_owned(),
             page_title: "Welcome!".to_owned(),
             password_label: "Password".to_owned(),
-            password_placeholder: "Password".to_owned(),
+            password_placeholder: "password".to_owned(),
+            wrong_password_message: "Wrong password.".to_owned(),
             submit_button_text: "Enter".to_owned(),
         }
     }
@@ -334,12 +355,23 @@ fn load_custom_template(path: Option<OsString>) -> Result<Option<String>, Config
     Ok(Some(template))
 }
 
-/// Render known markers from `template`, preserving unknown or absent
-/// markers. Scanning only the original template ensures marker-like text
-/// in an override is not interpreted recursively.
-fn render_template(template: &str, text: &TemplateText) -> Bytes {
+/// Render known markers from one template for the requested login state,
+/// preserving unknown or absent markers. Scanning only the original
+/// template ensures marker-like text in an override is not interpreted
+/// recursively.
+fn render_template(template: &str, text: &TemplateText, wrong_password: bool) -> Bytes {
     let mut rendered = String::with_capacity(template.len());
     let mut remaining = template;
+    // String form of the invalid flag, for `aria-invalid`.
+    let is_password_invalid = if wrong_password { "true" } else { "false" };
+    // Focus the field only on the error wall, so the failed-login state
+    // is announced immediately after submission (see `index.html`).
+    let autofocus = if wrong_password { "autofocus" } else { "" };
+    let wrong_password_message = if wrong_password {
+        text.wrong_password_message.as_str()
+    } else {
+        ""
+    };
 
     while let Some(marker_start) = remaining.find("{{") {
         rendered.push_str(&remaining[..marker_start]);
@@ -353,6 +385,9 @@ fn render_template(template: &str, text: &TemplateText) -> Bytes {
                 "{{PASSWORD_PLACEHOLDER}}",
                 text.password_placeholder.as_str(),
             ),
+            ("{{IS_PASSWORD_INVALID}}", is_password_invalid),
+            ("{{PASSWORD_AUTOFOCUS}}", autofocus),
+            ("{{WRONG_PASSWORD_MESSAGE}}", wrong_password_message),
             ("{{SUBMIT_BUTTON_TEXT}}", text.submit_button_text.as_str()),
         ]
         .into_iter()
@@ -612,8 +647,58 @@ mod tests {
         assert!(wall.contains("<html lang=\"en\">"));
         assert!(wall.contains("<title>Welcome!</title>"));
         assert!(wall.contains(">Password</label>"));
-        assert!(wall.contains("placeholder=\"Password\""));
+        assert!(wall.contains("placeholder=\"password\""));
         assert!(wall.contains(">Enter</button>"));
+    }
+
+    #[test]
+    fn default_wall_hides_the_wrong_password_error() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.wall()).unwrap();
+
+        assert!(wall.contains("aria-invalid=\"false\""));
+        assert!(!wall.contains("Wrong password."));
+    }
+
+    #[test]
+    fn wrong_password_wall_shows_the_error() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.wrong_password_wall()).unwrap();
+
+        assert!(wall.contains("aria-invalid=\"true\""));
+        assert!(wall.contains("Wrong password."));
+    }
+
+    #[test]
+    fn wrong_password_wall_autofocuses_the_field() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.wrong_password_wall()).unwrap();
+
+        // Scope the check to the `<input>` start tag: the page also carries
+        // a marker comment that mentions `autofocus`.
+        let tag = &wall[wall.find("<input").unwrap()..];
+        let tag = &tag[..tag.find('>').unwrap()];
+        assert!(tag.contains("autofocus"));
+    }
+
+    #[test]
+    fn default_wall_does_not_autofocus() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.wall()).unwrap();
+
+        let tag = &wall[wall.find("<input").unwrap()..];
+        let tag = &tag[..tag.find('>').unwrap()];
+        assert!(!tag.contains("autofocus"));
+    }
+
+    #[test]
+    fn built_in_wall_includes_the_alert_icon_glyph() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.wall()).unwrap();
+
+        // The lucide `circle-alert` outline; guards against the icon being
+        // dropped. Actual visibility is verified in the browser.
+        assert!(wall.contains(r#"<circle cx="12" cy="12" r="10">"#));
     }
 
     #[test]
@@ -731,6 +816,15 @@ mod tests {
     }
 
     #[test]
+    fn wrong_password_message_variable_overrides_the_default() {
+        let text = template_text_from_vars(&[(
+            ENV_TEMPLATE_WRONG_PASSWORD_MESSAGE,
+            "Mot de passe incorrect.",
+        )]);
+        assert_eq!(text.wrong_password_message, "Mot de passe incorrect.");
+    }
+
+    #[test]
     fn submit_button_text_variable_overrides_the_default() {
         let text = template_text_from_vars(&[(ENV_TEMPLATE_SUBMIT_BUTTON_TEXT, "Entrer")]);
         assert_eq!(text.submit_button_text, "Entrer");
@@ -778,7 +872,19 @@ mod tests {
             ..TemplateText::default()
         };
 
-        let rendered = render_template("{{PAGE_TITLE}}", &text);
+        let rendered = render_template("{{PAGE_TITLE}}", &text, false);
+
+        assert_eq!(rendered, "&amp;&lt;&gt;&quot;&#39;");
+    }
+
+    #[test]
+    fn wrong_password_message_is_html_escaped() {
+        let text = TemplateText {
+            wrong_password_message: "&<>\"'".to_owned(),
+            ..TemplateText::default()
+        };
+
+        let rendered = render_template("{{WRONG_PASSWORD_MESSAGE}}", &text, true);
 
         assert_eq!(rendered, "&amp;&lt;&gt;&quot;&#39;");
     }
@@ -791,20 +897,20 @@ mod tests {
             ..TemplateText::default()
         };
 
-        let rendered = render_template("{{PAGE_TITLE}}", &text);
+        let rendered = render_template("{{PAGE_TITLE}}", &text, false);
 
         assert_eq!(rendered, "{{SUBMIT_BUTTON_TEXT}}");
     }
 
     #[test]
     fn template_without_known_markers_is_unchanged() {
-        let rendered = render_template("<p>{{UNKNOWN}}</p>", &TemplateText::default());
+        let rendered = render_template("<p>{{UNKNOWN}}</p>", &TemplateText::default(), false);
         assert_eq!(rendered, "<p>{{UNKNOWN}}</p>");
     }
 
     #[test]
     fn renderer_leaves_an_empty_template_empty() {
-        let rendered = render_template("", &TemplateText::default());
+        let rendered = render_template("", &TemplateText::default(), false);
         assert!(rendered.is_empty());
     }
 

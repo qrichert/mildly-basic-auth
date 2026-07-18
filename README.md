@@ -200,14 +200,20 @@ non-root user (UID `10001`) on a Debian-slim image.[^debian]
 
 ### Template
 
-| Variable                            | Default       | Description                               |
-| ----------------------------------- | ------------- | ----------------------------------------- |
-| `MBA_TEMPLATE_FILE`                 | Built-in page | Path to custom password-page HTML.        |
-| `MBA_TEMPLATE_PAGE_LANGUAGE`        | `en`          | Document language used by assistive tech. |
-| `MBA_TEMPLATE_PAGE_TITLE`           | `Welcome!`    | Browser tab title.                        |
-| `MBA_TEMPLATE_PASSWORD_LABEL`       | `Password`    | Accessible password-field label.          |
-| `MBA_TEMPLATE_PASSWORD_PLACEHOLDER` | `Password`    | Visible password-field placeholder.       |
-| `MBA_TEMPLATE_SUBMIT_BUTTON_TEXT`   | `Enter`       | Submit-button text.                       |
+| Variable                                | Default           | Description                               |
+| --------------------------------------- | ----------------- | ----------------------------------------- |
+| `MBA_TEMPLATE_FILE`                     | Built-in page     | Path to custom password-page HTML.        |
+| `MBA_TEMPLATE_PAGE_LANGUAGE`            | `en`              | Document language used by assistive tech. |
+| `MBA_TEMPLATE_PAGE_TITLE`               | `Welcome!`        | Browser tab title.                        |
+| `MBA_TEMPLATE_PASSWORD_LABEL`\*         | `Password`        | Accessible password-field label.          |
+| `MBA_TEMPLATE_PASSWORD_PLACEHOLDER`     | `password`        | Visible password-field placeholder.       |
+| `MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE`\* | `Wrong password.` | Accessible failed-login message.          |
+| `MBA_TEMPLATE_SUBMIT_BUTTON_TEXT`       | `Enter`           | Submit-button text.                       |
+
+\* In the built-in page these are announced to assistive technologies
+only and not shown visually — sighted users see the placeholder and, on
+a failed login, the invalid-field icon and red border. A custom template
+may place the corresponding markers anywhere.
 
 #### Text overrides
 
@@ -221,7 +227,8 @@ environment:
   MBA_TEMPLATE_PAGE_LANGUAGE: "fr"
   MBA_TEMPLATE_PAGE_TITLE: "Mon site"
   MBA_TEMPLATE_PASSWORD_LABEL: "Mot de passe"
-  MBA_TEMPLATE_PASSWORD_PLACEHOLDER: "Votre mot de passe"
+  MBA_TEMPLATE_PASSWORD_PLACEHOLDER: "mot de passe"
+  MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE: "Mot de passe incorrect."
   MBA_TEMPLATE_SUBMIT_BUTTON_TEXT: "Entrer"
 ```
 
@@ -243,12 +250,13 @@ volumes:
 
 Copy and adapt [`src/index.html`](src/index.html); its structure is not
 validated. The file must be non-empty UTF-8 readable by container UID
-`10001`. It is loaded once at startup, so changes require a restart.
+`10001`. It is loaded once at startup, so changes require a restart. Its
+`{{...}}` markers, and how each one renders, are documented inline in
+the file.
 
-The text markers above also work in custom pages, but are escaped only
-for HTML text and quoted attributes—not JavaScript, CSS, or URLs. Custom
-HTML is public before authentication: keep it self-contained and never
-put secrets in it.
+Marker values are escaped only for HTML text and quoted attributes—not
+JavaScript, CSS, or URLs. Custom HTML is public before authentication:
+keep it self-contained and never put secrets in it.
 
 ## Roadmap
 
