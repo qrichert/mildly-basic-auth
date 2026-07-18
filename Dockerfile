@@ -1,5 +1,5 @@
-# Build stage: compile a release binary. `src/index.html` is embedded at
-# compile time (`include_str!`), so the runtime image needs no assets.
+# Build stage: compile a release binary. `src/template.html` is embedded
+# at compile time (`include_str!`), so the runtime image needs no assets.
 FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY . .

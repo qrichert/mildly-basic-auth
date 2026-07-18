@@ -248,11 +248,11 @@ volumes:
   - ./template.html:/etc/mba/template.html:ro
 ```
 
-Copy and adapt [`src/index.html`](src/index.html); its structure is not
-validated. The file must be non-empty UTF-8 readable by container UID
-`10001`. It is loaded once at startup, so changes require a restart. Its
-`{{...}}` markers, and how each one renders, are documented inline in
-the file.
+Copy and adapt [`src/template.html`](src/template.html); its structure
+is not validated. The file must be non-empty UTF-8 readable by container
+UID `10001`. It is loaded once at startup, so changes require a restart.
+Its `{{...}}` markers, and how each one renders, are documented inline
+in the file.
 
 Marker values are escaped only for HTML text and quoted attributes—not
 JavaScript, CSS, or URLs. Custom HTML is public before authentication:

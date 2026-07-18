@@ -1,4 +1,32 @@
 <!doctype html>
+<!--
+  Template placeholders use the uppercase names below between double
+  braces, as shown in the markup. Text values are HTML-escaped.
+
+  Configurable placeholders map to environment variables by adding the
+  `MBA_TEMPLATE_` prefix:
+
+  - `PAGE_LANGUAGE`: Document language (`<html lang="...">`).
+  - `PAGE_TITLE`: Page title (`<title>...</title>`).
+  - `PASSWORD_LABEL`: Password-field label (screen-reader-only in this
+    template).
+  - `PASSWORD_PLACEHOLDER`: Password-field placeholder.
+  - `WRONG_PASSWORD_MESSAGE`: Error text after a failed login and blank
+    otherwise (screen-reader-only in this template).
+  - `SUBMIT_BUTTON_TEXT`: Form submit button text.
+
+  Generated login-state placeholders are set internally:
+
+  - `_IS_PASSWORD_INVALID`: Literal `true` after a failed login and
+    `false` otherwise.
+  - `_PASSWORD_AUTOFOCUS_ATTRIBUTE`: Complete `autofocus` attribute
+    after a failed login and blank otherwise.
+
+  Templates may omit any placeholder. Unknown placeholders are preserved
+  unchanged.
+
+  Documentation: https://github.com/qrichert/mildly-basic-auth.
+-->
 <html lang="{{PAGE_LANGUAGE}}">
   <head>
     <meta charset="utf-8" />
@@ -284,16 +312,10 @@
           <div class="field">
             <label class="sr-only" for="password">{{PASSWORD_LABEL}}</label>
             <!--
-              These are filled per login state (markers are documented
-              by effect, not spelled out, so they are not themselves
-              substituted into this shipped comment): `aria-invalid` is
-              `true`/`false`, the error text (from
-              `MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE`) is empty until a
-              failed login, and the bare autofocus marker below renders
-              the `autofocus` attribute only on the failed-login page.
-              Keep that marker standalone — never quote it as an
-              attribute value: an empty boolean attribute is still "true",
-              so it would autofocus every page.
+              The `_PASSWORD_AUTOFOCUS_ATTRIBUTE` placeholder below
+              renders the complete `autofocus` attribute after a failed
+              login and nothing otherwise. Leave it standalone because
+              `autofocus=""` still enables autofocus.
             -->
             <input
               class="input"
@@ -303,8 +325,8 @@
               placeholder="{{PASSWORD_PLACEHOLDER}}"
               autocomplete="current-password"
               aria-describedby="password-error"
-              aria-invalid="{{IS_PASSWORD_INVALID}}"
-              {{PASSWORD_AUTOFOCUS}}
+              aria-invalid="{{_IS_PASSWORD_INVALID}}"
+              {{_PASSWORD_AUTOFOCUS_ATTRIBUTE}}
               required
             />
             <!--
@@ -333,9 +355,9 @@
               `aria-describedby` above. Empty on the normal wall, so no
               description and nothing is announced.
             -->
-            <span class="sr-only" id="password-error"
-              >{{WRONG_PASSWORD_MESSAGE}}</span
-            >
+            <span class="sr-only" id="password-error">
+              {{WRONG_PASSWORD_MESSAGE}}
+            </span>
           </div>
           <button class="button" type="submit">{{SUBMIT_BUTTON_TEXT}}</button>
         </form>

@@ -16,7 +16,7 @@ use blake3::Hash;
 
 /// Embedded password-page template. Compiled into the binary so rendering
 /// has no runtime asset dependency.
-const WALL_TEMPLATE: &str = include_str!("index.html");
+const WALL_TEMPLATE: &str = include_str!("template.html");
 /// Default IP socket address the service listens on.
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8000";
 /// Environment variable holding the IP socket address to listen on.
@@ -365,8 +365,8 @@ fn render_template(template: &str, text: &TemplateText, wrong_password: bool) ->
     // String form of the invalid flag, for `aria-invalid`.
     let is_password_invalid = if wrong_password { "true" } else { "false" };
     // Focus the field only on the error wall, so the failed-login state
-    // is announced immediately after submission (see `index.html`).
-    let autofocus = if wrong_password { "autofocus" } else { "" };
+    // is announced immediately after submission (see `template.html`).
+    let autofocus_attribute = if wrong_password { "autofocus" } else { "" };
     let wrong_password_message = if wrong_password {
         text.wrong_password_message.as_str()
     } else {
@@ -385,10 +385,10 @@ fn render_template(template: &str, text: &TemplateText, wrong_password: bool) ->
                 "{{PASSWORD_PLACEHOLDER}}",
                 text.password_placeholder.as_str(),
             ),
-            ("{{IS_PASSWORD_INVALID}}", is_password_invalid),
-            ("{{PASSWORD_AUTOFOCUS}}", autofocus),
             ("{{WRONG_PASSWORD_MESSAGE}}", wrong_password_message),
             ("{{SUBMIT_BUTTON_TEXT}}", text.submit_button_text.as_str()),
+            ("{{_IS_PASSWORD_INVALID}}", is_password_invalid),
+            ("{{_PASSWORD_AUTOFOCUS_ATTRIBUTE}}", autofocus_attribute),
         ]
         .into_iter()
         .find(|(marker, _)| remaining.starts_with(marker));
