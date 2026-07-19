@@ -6,8 +6,13 @@ on:
       - '*.*.*'
 
 jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build
+    needs: ci
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -107,6 +112,7 @@ jobs:
   # uses the job's package-scoped `GITHUB_TOKEN`.
   docker:
     name: Publish Docker image
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read
