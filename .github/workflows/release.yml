@@ -107,12 +107,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Independent of the binary release. Docker Hub needs the
-  # `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR
-  # uses the job's package-scoped `GITHUB_TOKEN`.
+  # Docker Hub needs the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
+  # repository secrets. GHCR uses the job's package-scoped
+  # `GITHUB_TOKEN`.
   docker:
     name: Publish Docker image
-    needs: ci
+    needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: read
