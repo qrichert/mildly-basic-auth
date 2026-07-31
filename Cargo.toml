@@ -7,7 +7,7 @@ description = "Basic auth with nicer UX."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/qrichert/mildly-basic-auth.git"
 readme = "README.md"
-keywords = ["authentication", "password", "basic-auth", "password-wall", "reverse-proxy"]
+keywords = ["auth-proxy", "basic-auth", "password-wall", "reverse-proxy", "session-cookie"]
 categories = ["authentication", "web-programming"]
 
 [profile.release]

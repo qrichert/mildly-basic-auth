@@ -55,10 +55,8 @@ Everything else follows from that:
 Images are published to Docker Hub as [`qrichert/mildly-basic-auth`] and
 to GitHub Container Registry as [`ghcr.io/qrichert/mildly-basic-auth`].
 
-[`qrichert/mildly-basic-auth`]:
-  https://hub.docker.com/r/qrichert/mildly-basic-auth
-[`ghcr.io/qrichert/mildly-basic-auth`]:
-  https://github.com/qrichert/mildly-basic-auth/pkgs/container/mildly-basic-auth
+[`qrichert/mildly-basic-auth`]: https://hub.docker.com/r/qrichert/mildly-basic-auth
+[`ghcr.io/qrichert/mildly-basic-auth`]: https://github.com/qrichert/mildly-basic-auth/pkgs/container/mildly-basic-auth
 
 ### Drop-in
 
@@ -152,22 +150,17 @@ docs.example.com {
 
 ### Without Docker
 
-It is a single static binary. Download a pre-built binary from [GitHub
-Releases], or install it from [crates.io]. Then hand it the same two
+It is a single static binary. Install it as described in the
+[installation section](#installation), then hand it the same two
 variables (it binds `0.0.0.0:8000` by default):
 
 ```console
-$ cargo install mildly-basic-auth
 $ MBA_PASSWORD='…' MBA_UPSTREAM='http://127.0.0.1:2001' mildly-basic-auth
 ```
 
 Bind each protected upstream to localhost or block its port with a
 firewall. If clients can reach the upstream directly, they can bypass
 authentication.
-
-[GitHub Releases]:
-  https://github.com/qrichert/mildly-basic-auth/releases
-[crates.io]: https://crates.io/crates/mildly-basic-auth
 
 ## Configuration
 
@@ -293,3 +286,20 @@ General traffic controls such as rate limiting and host allow-listing
 belong at the edge, not here. Also deliberately out of scope,
 permanently: LDAP, OAuth, an admin panel, policy rules, Redis, MFA/TOTP,
 and SSO.
+
+## Installation
+
+Install from [crates.io] with Cargo:
+
+```shell
+cargo install mildly-basic-auth
+```
+
+Pre-built binaries for Linux and macOS are available on the [latest
+GitHub release].
+
+[Documentation] is available on docs.rs.
+
+[crates.io]: https://crates.io/crates/mildly-basic-auth
+[latest GitHub release]: https://github.com/qrichert/mildly-basic-auth/releases/latest
+[Documentation]: https://docs.rs/mildly-basic-auth
