@@ -55,8 +55,10 @@ Everything else follows from that:
 Images are published to Docker Hub as [`qrichert/mildly-basic-auth`] and
 to GitHub Container Registry as [`ghcr.io/qrichert/mildly-basic-auth`].
 
-[`qrichert/mildly-basic-auth`]: https://hub.docker.com/r/qrichert/mildly-basic-auth
-[`ghcr.io/qrichert/mildly-basic-auth`]: https://github.com/qrichert/mildly-basic-auth/pkgs/container/mildly-basic-auth
+[`qrichert/mildly-basic-auth`]:
+  https://hub.docker.com/r/qrichert/mildly-basic-auth
+[`ghcr.io/qrichert/mildly-basic-auth`]:
+  https://github.com/qrichert/mildly-basic-auth/pkgs/container/mildly-basic-auth
 
 ### Drop-in
 
@@ -301,5 +303,6 @@ GitHub release].
 [Documentation] is available on docs.rs.
 
 [crates.io]: https://crates.io/crates/mildly-basic-auth
-[latest GitHub release]: https://github.com/qrichert/mildly-basic-auth/releases/latest
+[latest GitHub release]:
+  https://github.com/qrichert/mildly-basic-auth/releases/latest
 [Documentation]: https://docs.rs/mildly-basic-auth
