@@ -480,8 +480,9 @@ async fn raw_request(authority: &str, request: &str) -> String {
 }
 
 #[test]
-fn template_text_variables_customize_wall_responses() {
-    let password = format!("template-text-test-{}", std::process::id());
+fn template_variables_customize_wall_responses() {
+    let password = format!("template-test-{}", std::process::id());
+    let icon = r#"<div aria-hidden="true">🦖</div>"#;
     let mut failures = Vec::new();
 
     // Retry the complete attempt if another process wins the allocation-to-
@@ -497,6 +498,7 @@ fn template_text_variables_customize_wall_responses() {
             .env("MBA_UPSTREAM", "http://127.0.0.1:9")
             .env("MBA_TEMPLATE_PAGE_LANGUAGE", "fr")
             .env("MBA_TEMPLATE_PAGE_TITLE", "Mon site")
+            .env("MBA_TEMPLATE_ICON", icon)
             .env("MBA_TEMPLATE_PASSWORD_LABEL", "Mot de passe")
             .env("MBA_TEMPLATE_PASSWORD_PLACEHOLDER", "mot de passe")
             .env(
@@ -550,6 +552,8 @@ fn template_text_variables_customize_wall_responses() {
             assert!(get_body.contains(">Mot de passe</label>"));
             assert!(get_body.contains("placeholder=\"mot de passe\""));
             assert!(get_body.contains(">Entrer</button>"));
+            assert!(get_body.contains(icon));
+            assert!(post_body.contains(icon));
             return;
         }
         failures.push(format!(
@@ -582,6 +586,7 @@ fn template_file_customizes_every_wall_response() {
     assert!(get_body.contains("<title>Welcome!</title>"));
     assert!(get_body.contains("CUSTOM_TEMPLATE"));
     assert!(!get_body.contains("{{PAGE_TITLE}}"));
+    assert!(!get_body.contains("lucide.dev/icons/lock"));
 }
 
 #[test]

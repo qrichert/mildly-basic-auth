@@ -210,6 +210,7 @@ non-root user (UID `10001`) on a Debian-slim image.[^debian]
 | `MBA_TEMPLATE_FILE`                     | Built-in page     | Path to custom password-page HTML.        |
 | `MBA_TEMPLATE_PAGE_LANGUAGE`            | `en`              | Document language used by assistive tech. |
 | `MBA_TEMPLATE_PAGE_TITLE`               | `Welcome!`        | Browser tab title.                        |
+| `MBA_TEMPLATE_ICON`                     | Lucide lock SVG   | Complete icon HTML fragment.              |
 | `MBA_TEMPLATE_PASSWORD_LABEL`\*         | `Password`        | Accessible password-field label.          |
 | `MBA_TEMPLATE_PASSWORD_PLACEHOLDER`     | `password`        | Visible password-field placeholder.       |
 | `MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE`\* | `Wrong password.` | Accessible failed-login message.          |
@@ -219,6 +220,46 @@ non-root user (UID `10001`) on a Debian-slim image.[^debian]
 only and not shown visually — sighted users see the placeholder and, on
 a failed login, the invalid-field icon and red border. A custom template
 may place the corresponding markers anywhere.
+
+#### Icon override
+
+`MBA_TEMPLATE_ICON` replaces the whole icon with unescaped HTML—no
+wrapper or class is added. An empty value removes it.
+
+The default is the Lucide lock:
+
+```yaml
+environment:
+  MBA_TEMPLATE_ICON: |
+    <!-- Lock icon from Lucide (https://lucide.dev/icons/lock), ISC license. -->
+    <svg
+      style="margin: 0 auto; width: 1.5rem; height: 1.5rem;"
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <rect width="18" height="11" x="3" y="11" rx="2" ry="2"></rect>
+      <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+    </svg>
+```
+
+An emoji works too:
+
+```yaml
+environment:
+  MBA_TEMPLATE_ICON: |
+    <div
+      style="margin: 0 auto; font-size: 2.2rem; line-height: 2.3rem;"
+      aria-hidden="true"
+    >
+      🦖
+    </div>
+```
 
 #### Text overrides
 
@@ -259,9 +300,10 @@ UID `10001`. It is loaded once at startup, so changes require a restart.
 Its `{{...}}` markers, and how each one renders, are documented inline
 in the file.
 
-Marker values are escaped only for HTML text and quoted attributes—not
-JavaScript, CSS, or URLs. Custom HTML is public before authentication:
-keep it self-contained and never put secrets in it.
+Text marker values are escaped only for HTML text and quoted
+attributes—not JavaScript, CSS, or URLs. `{{ICON}}` is inserted
+verbatim. Custom HTML is public before authentication: keep it
+self-contained and never put secrets in it.
 
 ## Roadmap
 

@@ -1,13 +1,15 @@
 <!doctype html>
 <!--
   Template placeholders use the uppercase names below between double
-  braces, as shown in the markup. Text values are HTML-escaped.
+  braces, as shown in the markup. Values are HTML-escaped except where
+  explicitly documented otherwise.
 
   Configurable placeholders map to environment variables by adding the
   `MBA_TEMPLATE_` prefix:
 
   - `PAGE_LANGUAGE`: Document language (`<html lang="...">`).
   - `PAGE_TITLE`: Page title (`<title>...</title>`).
+  - `ICON`: Complete icon HTML fragment. Inserted unescaped.
   - `PASSWORD_LABEL`: Password-field label (screen-reader-only in this
     template).
   - `PASSWORD_PLACEHOLDER`: Password-field placeholder.
@@ -112,13 +114,6 @@
         max-width: 24rem;
         flex-direction: column;
         gap: 1.5rem;
-      }
-
-      .lock {
-        width: 1.5rem;
-        height: 1.5rem;
-        margin: 0 auto;
-        color: var(--foreground);
       }
 
       .form {
@@ -293,21 +288,7 @@
   <body>
     <main class="page">
       <div class="panel">
-        <!-- Lock icon from Lucide (https://lucide.dev/icons/lock), ISC license. -->
-        <svg
-          class="lock"
-          xmlns="http://www.w3.org/2000/svg"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
-        >
-          <rect width="18" height="11" x="3" y="11" rx="2" ry="2"></rect>
-          <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
-        </svg>
+        {{ICON}}
         <form class="form" method="post">
           <div class="field">
             <label class="sr-only" for="password">{{PASSWORD_LABEL}}</label>

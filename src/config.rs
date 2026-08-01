@@ -17,6 +17,24 @@ use blake3::Hash;
 /// Embedded password-page template. Compiled into the binary so rendering
 /// has no runtime asset dependency.
 const WALL_TEMPLATE: &str = include_str!("template.html");
+/// Default password-page icon. The continuation indentation
+/// preserves the built-in template's rendered formatting when
+/// replacing `{{ICON}}`.
+const DEFAULT_TEMPLATE_ICON: &str = r#"<!-- Lock icon from Lucide (https://lucide.dev/icons/lock), ISC license. -->
+        <svg
+          style="margin: 0 auto; width: 1.5rem; height: 1.5rem;"
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <rect width="18" height="11" x="3" y="11" rx="2" ry="2"></rect>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+        </svg>"#;
 /// Default IP socket address the service listens on.
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8000";
 /// Environment variable holding the IP socket address to listen on.
@@ -37,6 +55,9 @@ const ENV_TEMPLATE_FILE: &str = "MBA_TEMPLATE_FILE";
 const ENV_TEMPLATE_PAGE_LANGUAGE: &str = "MBA_TEMPLATE_PAGE_LANGUAGE";
 /// Environment variable overriding the password page's title.
 const ENV_TEMPLATE_PAGE_TITLE: &str = "MBA_TEMPLATE_PAGE_TITLE";
+/// Environment variable overriding the complete password-page icon HTML
+/// fragment. Unlike template text, the fragment is inserted unescaped.
+const ENV_TEMPLATE_ICON: &str = "MBA_TEMPLATE_ICON";
 /// Environment variable overriding the password field's accessible label.
 const ENV_TEMPLATE_PASSWORD_LABEL: &str = "MBA_TEMPLATE_PASSWORD_LABEL";
 /// Environment variable overriding the password field's placeholder.
@@ -95,8 +116,8 @@ impl Config {
     /// Returns [`ConfigError`] if `MBA_ADDRESS` is not a valid non-zero
     /// IP socket address, no `MBA_PASSWORD*` variable has a non-empty
     /// UTF-8 value, two of them share the same value, a custom template
-    /// file is unusable, a template-text override is not valid Unicode,
-    /// or `MBA_UPSTREAM` is not a valid absolute HTTP(S) URL.
+    /// file is unusable, a template override is not valid Unicode, or
+    /// `MBA_UPSTREAM` is not a valid absolute HTTP(S) URL.
     pub fn from_env() -> Result<Self, ConfigError> {
         let address = match std::env::var(ENV_ADDRESS) {
             Ok(address) => address,
@@ -112,14 +133,14 @@ impl Config {
         let passwords: Vec<&str> = passwords.iter().map(String::as_str).collect();
         let custom_template = load_custom_template(std::env::var_os(ENV_TEMPLATE_FILE))?;
         let template = custom_template.as_deref().unwrap_or(WALL_TEMPLATE);
-        let template_text = TemplateText::from_env(std::env::vars_os())?;
+        let template_values = TemplateValues::from_env(std::env::vars_os())?;
         let upstream = std::env::var(ENV_UPSTREAM).unwrap_or_default();
-        Self::from_passwords_address_template_and_text(
+        Self::from_passwords_address_template_and_values(
             &passwords,
             &upstream,
             &address,
             template,
-            &template_text,
+            &template_values,
         )
     }
 
@@ -190,23 +211,23 @@ impl Config {
         upstream: &str,
         address: &str,
     ) -> Result<Self, ConfigError> {
-        Self::from_passwords_address_template_and_text(
+        Self::from_passwords_address_template_and_values(
             passwords,
             upstream,
             address,
             WALL_TEMPLATE,
-            &TemplateText::default(),
+            &TemplateValues::default(),
         )
     }
 
-    /// Build and validate the complete runtime configuration with an
-    /// explicit password-page template and text.
-    fn from_passwords_address_template_and_text(
+    /// Build and validate the complete runtime configuration with
+    /// explicit password-page template values.
+    fn from_passwords_address_template_and_values(
         passwords: &[&str],
         upstream: &str,
         address: &str,
         template: &str,
-        template_text: &TemplateText,
+        template_values: &TemplateValues,
     ) -> Result<Self, ConfigError> {
         // Keep non-empty values (drop unset/blank vars).
         let passwords: Vec<&str> = passwords
@@ -234,8 +255,8 @@ impl Config {
             .collect();
         let upstream = validate_upstream(upstream)?;
         let address = validate_address(address)?;
-        let wall = render_template(template, template_text, false);
-        let wrong_password_wall = render_template(template, template_text, true);
+        let wall = render_template(template, template_values, false);
+        let wrong_password_wall = render_template(template, template_values, true);
         Ok(Self {
             bind_address: address,
             sessions,
@@ -281,31 +302,34 @@ impl fmt::Debug for Config {
     }
 }
 
-/// Text substituted into the password-page template.
-struct TemplateText {
+/// Configurable values substituted into the password-page template.
+/// Text fields are HTML-escaped; `icon_html` is inserted verbatim.
+struct TemplateValues {
     page_language: String,
     page_title: String,
+    icon_html: String,
     password_label: String,
     password_placeholder: String,
     wrong_password_message: String,
     submit_button_text: String,
 }
 
-impl TemplateText {
-    /// Read fixed template-text overrides from the environment. Unknown
+impl TemplateValues {
+    /// Read fixed template overrides from the environment. Unknown
     /// `MBA_TEMPLATE_*` variables are deliberately ignored: the prefix is
     /// reserved for explicit settings, including the future template file.
     fn from_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Result<Self, ConfigError> {
-        let mut text = Self::default();
+        let mut values = Self::default();
         for (name, value) in vars {
             let Some(name) = name.to_str() else { continue };
             let target = match name {
-                ENV_TEMPLATE_PAGE_LANGUAGE => &mut text.page_language,
-                ENV_TEMPLATE_PAGE_TITLE => &mut text.page_title,
-                ENV_TEMPLATE_PASSWORD_LABEL => &mut text.password_label,
-                ENV_TEMPLATE_PASSWORD_PLACEHOLDER => &mut text.password_placeholder,
-                ENV_TEMPLATE_WRONG_PASSWORD_MESSAGE => &mut text.wrong_password_message,
-                ENV_TEMPLATE_SUBMIT_BUTTON_TEXT => &mut text.submit_button_text,
+                ENV_TEMPLATE_PAGE_LANGUAGE => &mut values.page_language,
+                ENV_TEMPLATE_PAGE_TITLE => &mut values.page_title,
+                ENV_TEMPLATE_ICON => &mut values.icon_html,
+                ENV_TEMPLATE_PASSWORD_LABEL => &mut values.password_label,
+                ENV_TEMPLATE_PASSWORD_PLACEHOLDER => &mut values.password_placeholder,
+                ENV_TEMPLATE_WRONG_PASSWORD_MESSAGE => &mut values.wrong_password_message,
+                ENV_TEMPLATE_SUBMIT_BUTTON_TEXT => &mut values.submit_button_text,
                 _ => continue,
             };
             *target = value
@@ -314,15 +338,16 @@ impl TemplateText {
                     variable: name.to_owned(),
                 })?;
         }
-        Ok(text)
+        Ok(values)
     }
 }
 
-impl Default for TemplateText {
+impl Default for TemplateValues {
     fn default() -> Self {
         Self {
             page_language: "en".to_owned(),
             page_title: "Welcome!".to_owned(),
+            icon_html: DEFAULT_TEMPLATE_ICON.to_owned(),
             password_label: "Password".to_owned(),
             password_placeholder: "password".to_owned(),
             wrong_password_message: "Wrong password.".to_owned(),
@@ -359,7 +384,7 @@ fn load_custom_template(path: Option<OsString>) -> Result<Option<String>, Config
 /// preserving unknown or absent markers. Scanning only the original
 /// template ensures marker-like text in an override is not interpreted
 /// recursively.
-fn render_template(template: &str, text: &TemplateText, wrong_password: bool) -> Bytes {
+fn render_template(template: &str, values: &TemplateValues, wrong_password: bool) -> Bytes {
     let mut rendered = String::with_capacity(template.len());
     let mut remaining = template;
     // String form of the invalid flag, for `aria-invalid`.
@@ -368,7 +393,7 @@ fn render_template(template: &str, text: &TemplateText, wrong_password: bool) ->
     // is announced immediately after submission (see `template.html`).
     let autofocus_attribute = if wrong_password { "autofocus" } else { "" };
     let wrong_password_message = if wrong_password {
-        text.wrong_password_message.as_str()
+        values.wrong_password_message.as_str()
     } else {
         ""
     };
@@ -377,16 +402,25 @@ fn render_template(template: &str, text: &TemplateText, wrong_password: bool) ->
         rendered.push_str(&remaining[..marker_start]);
         remaining = &remaining[marker_start..];
 
+        // The icon owns its complete element and styling. Keep its raw
+        // HTML replacement isolated so every other configurable value
+        // remains escaped by default.
+        if remaining.starts_with("{{ICON}}") {
+            rendered.push_str(&values.icon_html);
+            remaining = &remaining["{{ICON}}".len()..];
+            continue;
+        }
+
         let replacement = [
-            ("{{PAGE_LANGUAGE}}", text.page_language.as_str()),
-            ("{{PAGE_TITLE}}", text.page_title.as_str()),
-            ("{{PASSWORD_LABEL}}", text.password_label.as_str()),
+            ("{{PAGE_LANGUAGE}}", values.page_language.as_str()),
+            ("{{PAGE_TITLE}}", values.page_title.as_str()),
+            ("{{PASSWORD_LABEL}}", values.password_label.as_str()),
             (
                 "{{PASSWORD_PLACEHOLDER}}",
-                text.password_placeholder.as_str(),
+                values.password_placeholder.as_str(),
             ),
             ("{{WRONG_PASSWORD_MESSAGE}}", wrong_password_message),
-            ("{{SUBMIT_BUTTON_TEXT}}", text.submit_button_text.as_str()),
+            ("{{SUBMIT_BUTTON_TEXT}}", values.submit_button_text.as_str()),
             ("{{_IS_PASSWORD_INVALID}}", is_password_invalid),
             ("{{_PASSWORD_AUTOFOCUS_ATTRIBUTE}}", autofocus_attribute),
         ]
@@ -544,7 +578,7 @@ pub enum ConfigError {
     /// Two `MBA_PASSWORD*` variables shared the same value, which would
     /// break independent revocation.
     DuplicatePassword,
-    /// A configured template-text override was not valid Unicode.
+    /// A configured template string override was not valid Unicode.
     InvalidTemplateText { variable: String },
     /// `MBA_TEMPLATE_FILE` did not name a usable UTF-8 template.
     InvalidTemplateFile { path: PathBuf, reason: String },
@@ -624,10 +658,10 @@ mod tests {
         }
     }
 
-    /// Build template text from explicit variables without mutating the
+    /// Build template values from explicit variables without mutating the
     /// process-wide environment.
-    fn template_text_from_vars(vars: &[(&str, &str)]) -> TemplateText {
-        TemplateText::from_env(
+    fn template_values_from_vars(vars: &[(&str, &str)]) -> TemplateValues {
+        TemplateValues::from_env(
             vars.iter()
                 .map(|(name, value)| (OsString::from(name), OsString::from(value))),
         )
@@ -692,6 +726,22 @@ mod tests {
     }
 
     #[test]
+    fn default_wall_includes_the_lock_icon_glyph() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.wall()).unwrap();
+
+        assert!(wall.contains(r#"<path d="M7 11V7a5 5 0 0 1 10 0v4">"#));
+    }
+
+    #[test]
+    fn default_lock_icon_preserves_its_layout() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.wall()).unwrap();
+
+        assert!(wall.contains(r#"style="margin: 0 auto; width: 1.5rem; height: 1.5rem;""#));
+    }
+
+    #[test]
     fn built_in_wall_includes_the_alert_icon_glyph() {
         let config = Config::from_values("hunter2", "http://app:2001").unwrap();
         let wall = std::str::from_utf8(config.wall()).unwrap();
@@ -717,17 +767,17 @@ mod tests {
 
     #[test]
     fn explicit_template_uses_configured_text() {
-        let text = TemplateText {
+        let values = TemplateValues {
             page_title: "Custom title".to_owned(),
-            ..TemplateText::default()
+            ..TemplateValues::default()
         };
 
-        let config = Config::from_passwords_address_template_and_text(
+        let config = Config::from_passwords_address_template_and_values(
             &["hunter2"],
             "http://app:2001",
             DEFAULT_BIND_ADDRESS,
             "<title>{{PAGE_TITLE}}</title>",
-            &text,
+            &values,
         )
         .unwrap();
 
@@ -793,31 +843,37 @@ mod tests {
 
     #[test]
     fn page_language_variable_overrides_the_default() {
-        let text = template_text_from_vars(&[(ENV_TEMPLATE_PAGE_LANGUAGE, "fr")]);
+        let text = template_values_from_vars(&[(ENV_TEMPLATE_PAGE_LANGUAGE, "fr")]);
         assert_eq!(text.page_language, "fr");
     }
 
     #[test]
     fn page_title_variable_overrides_the_default() {
-        let text = template_text_from_vars(&[(ENV_TEMPLATE_PAGE_TITLE, "Mon site")]);
+        let text = template_values_from_vars(&[(ENV_TEMPLATE_PAGE_TITLE, "Mon site")]);
         assert_eq!(text.page_title, "Mon site");
     }
 
     #[test]
+    fn icon_variable_overrides_the_default() {
+        let values = template_values_from_vars(&[(ENV_TEMPLATE_ICON, "🦖")]);
+        assert_eq!(values.icon_html, "🦖");
+    }
+
+    #[test]
     fn password_label_variable_overrides_the_default() {
-        let text = template_text_from_vars(&[(ENV_TEMPLATE_PASSWORD_LABEL, "Mot de passe")]);
+        let text = template_values_from_vars(&[(ENV_TEMPLATE_PASSWORD_LABEL, "Mot de passe")]);
         assert_eq!(text.password_label, "Mot de passe");
     }
 
     #[test]
     fn password_placeholder_variable_overrides_the_default() {
-        let text = template_text_from_vars(&[(ENV_TEMPLATE_PASSWORD_PLACEHOLDER, "Secret")]);
+        let text = template_values_from_vars(&[(ENV_TEMPLATE_PASSWORD_PLACEHOLDER, "Secret")]);
         assert_eq!(text.password_placeholder, "Secret");
     }
 
     #[test]
     fn wrong_password_message_variable_overrides_the_default() {
-        let text = template_text_from_vars(&[(
+        let text = template_values_from_vars(&[(
             ENV_TEMPLATE_WRONG_PASSWORD_MESSAGE,
             "Mot de passe incorrect.",
         )]);
@@ -826,19 +882,19 @@ mod tests {
 
     #[test]
     fn submit_button_text_variable_overrides_the_default() {
-        let text = template_text_from_vars(&[(ENV_TEMPLATE_SUBMIT_BUTTON_TEXT, "Entrer")]);
+        let text = template_values_from_vars(&[(ENV_TEMPLATE_SUBMIT_BUTTON_TEXT, "Entrer")]);
         assert_eq!(text.submit_button_text, "Entrer");
     }
 
     #[test]
     fn empty_template_text_variable_overrides_the_default() {
-        let text = template_text_from_vars(&[(ENV_TEMPLATE_PAGE_TITLE, "")]);
+        let text = template_values_from_vars(&[(ENV_TEMPLATE_PAGE_TITLE, "")]);
         assert!(text.page_title.is_empty());
     }
 
     #[test]
     fn unknown_template_variable_is_ignored() {
-        let text = template_text_from_vars(&[(ENV_TEMPLATE_FILE, "/tmp/wall.html")]);
+        let text = template_values_from_vars(&[(ENV_TEMPLATE_FILE, "/tmp/wall.html")]);
         assert_eq!(text.page_title, "Welcome!");
     }
 
@@ -847,7 +903,7 @@ mod tests {
     fn non_unicode_template_text_is_rejected() {
         use std::os::unix::ffi::OsStringExt;
 
-        let result = TemplateText::from_env(
+        let result = TemplateValues::from_env(
             [(
                 OsString::from(ENV_TEMPLATE_PAGE_TITLE),
                 OsString::from_vec(vec![0xff]),
@@ -865,11 +921,71 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_template_icon_is_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let result = TemplateValues::from_env(
+            [(
+                OsString::from(ENV_TEMPLATE_ICON),
+                OsString::from_vec(vec![0xff]),
+            )]
+            .into_iter(),
+        );
+
+        let Err(error) = result else {
+            panic!("non-Unicode template icon was accepted");
+        };
+        assert_matches!(
+            error,
+            ConfigError::InvalidTemplateText { variable }
+                if variable == ENV_TEMPLATE_ICON
+        );
+    }
+
+    #[test]
+    fn icon_html_is_rendered_verbatim() {
+        let values = TemplateValues {
+            icon_html: r#"<svg aria-hidden="true"></svg>"#.to_owned(),
+            ..TemplateValues::default()
+        };
+
+        let rendered = render_template("{{ICON}}", &values, false);
+
+        assert_eq!(rendered, r#"<svg aria-hidden="true"></svg>"#);
+    }
+
+    #[test]
+    fn empty_icon_html_removes_the_marker() {
+        let values = TemplateValues {
+            icon_html: String::new(),
+            ..TemplateValues::default()
+        };
+
+        let rendered = render_template("before{{ICON}}after", &values, false);
+
+        assert_eq!(rendered, "beforeafter");
+    }
+
+    #[test]
+    fn icon_html_is_not_rendered_recursively() {
+        let values = TemplateValues {
+            icon_html: "{{PAGE_TITLE}}".to_owned(),
+            page_title: "Recursive title".to_owned(),
+            ..TemplateValues::default()
+        };
+
+        let rendered = render_template("{{ICON}}", &values, false);
+
+        assert_eq!(rendered, "{{PAGE_TITLE}}");
+    }
+
     #[test]
     fn template_values_are_html_escaped() {
-        let text = TemplateText {
+        let text = TemplateValues {
             page_title: "&<>\"'".to_owned(),
-            ..TemplateText::default()
+            ..TemplateValues::default()
         };
 
         let rendered = render_template("{{PAGE_TITLE}}", &text, false);
@@ -879,9 +995,9 @@ mod tests {
 
     #[test]
     fn wrong_password_message_is_html_escaped() {
-        let text = TemplateText {
+        let text = TemplateValues {
             wrong_password_message: "&<>\"'".to_owned(),
-            ..TemplateText::default()
+            ..TemplateValues::default()
         };
 
         let rendered = render_template("{{WRONG_PASSWORD_MESSAGE}}", &text, true);
@@ -891,10 +1007,10 @@ mod tests {
 
     #[test]
     fn template_values_are_not_rendered_recursively() {
-        let text = TemplateText {
+        let text = TemplateValues {
             page_title: "{{SUBMIT_BUTTON_TEXT}}".to_owned(),
             submit_button_text: "Submit".to_owned(),
-            ..TemplateText::default()
+            ..TemplateValues::default()
         };
 
         let rendered = render_template("{{PAGE_TITLE}}", &text, false);
@@ -904,13 +1020,13 @@ mod tests {
 
     #[test]
     fn template_without_known_markers_is_unchanged() {
-        let rendered = render_template("<p>{{UNKNOWN}}</p>", &TemplateText::default(), false);
+        let rendered = render_template("<p>{{UNKNOWN}}</p>", &TemplateValues::default(), false);
         assert_eq!(rendered, "<p>{{UNKNOWN}}</p>");
     }
 
     #[test]
     fn renderer_leaves_an_empty_template_empty() {
-        let rendered = render_template("", &TemplateText::default(), false);
+        let rendered = render_template("", &TemplateValues::default(), false);
         assert!(rendered.is_empty());
     }
 
