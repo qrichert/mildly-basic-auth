@@ -16,6 +16,24 @@ _Basic auth with nicer UX._
   <img alt="Rendered visual of the auth gate." src="https://raw.githubusercontent.com/qrichert/mildly-basic-auth/main/demo/light.png">
 </picture>
 
+## TL;DR
+
+```yml
+services:
+  # 1. Add the gate.
+  auth-gate:
+    image: qrichert/mildly-basic-auth:latest
+    # 2. Make the gate public.
+    ports:
+      - "80:8000"
+    environment:
+      # 3. Set a password.
+      MBA_PASSWORD: "Tr0ub4dor&3"
+      # 4. Tell it where to forward authenticated traffic.
+      MBA_UPSTREAM: http://<service>:<port>
+      # More options available, read below...
+```
+
 ## What it is
 
 `mildly-basic-auth` puts a password page in front of anything that
