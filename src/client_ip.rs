@@ -35,13 +35,6 @@ use ipnet::IpNet;
 /// For example, peer `10.0.0.1` and chain `203.0.113.42, 10.0.0.2`
 /// yield `203.0.113.42` when `10.0.0.0/24` is trusted, or `10.0.0.1`
 /// when no proxies are trusted.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Pending IP-based throttling and allowlist consumers"
-    )
-)]
 pub(crate) fn resolve_client_ip(
     peer: Option<SocketAddr>,
     headers: &HeaderMap,

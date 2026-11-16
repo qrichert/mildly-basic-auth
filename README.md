@@ -169,6 +169,9 @@ docs.example.com {
 }
 ```
 
+Set `MBA_TRUSTED_PROXY_IPS` so login throttling can tell visitors apart
+behind Caddy (see [Login throttling](#login-throttling)).
+
 ### Without Docker
 
 It is a single static binary. Install it as described in the
@@ -194,11 +197,10 @@ authentication.
 
 ### General
 
-| Variable                | Required | Description                                           |
-| ----------------------- | -------- | ----------------------------------------------------- |
-| `MBA_ADDRESS`           | no       | IP and port to bind. Defaults to `0.0.0.0:8000`.      |
-| `MBA_PASSWORD_<tag>`    | no\*     | An additional password; `<tag>` is a free-form label. |
-| `MBA_TRUSTED_PROXY_IPS` | no       | Comma-separated proxy IPs or CIDRs. Empty by default. |
+| Variable             | Required | Description                                           |
+| -------------------- | -------- | ----------------------------------------------------- |
+| `MBA_ADDRESS`        | no       | IP and port to bind. Defaults to `0.0.0.0:8000`.      |
+| `MBA_PASSWORD_<tag>` | no\*     | An additional password; `<tag>` is a free-form label. |
 
 \* At least one password must be set — `MBA_PASSWORD` or any
 `MBA_PASSWORD_<tag>`; there is no privileged base variable. Passwords
@@ -208,12 +210,6 @@ sessions created with it.
 
 `MBA_ADDRESS` accepts a concrete IPv4 or bracketed IPv6 address, not a
 hostname, and the port must not be zero.
-
-`MBA_TRUSTED_PROXY_IPS` treats connections from the listed IPs or
-networks as proxies, accepting their `X-Forwarded-For` client addresses.
-This lets future login throttling and IP-based password bypass use the
-visitors' addresses behind a proxy. Leave it unset for now: those
-features are not active yet. Invalid values stop startup.
 
 A missing or empty required variable, a duplicate password, or an
 invalid `MBA_ADDRESS` is a hard startup error, not a silent passthrough
@@ -229,18 +225,39 @@ non-root user (UID `10001`) on a Debian-slim image.[^debian]
     pure-Rust TLS stack (rustls + blake3, no OpenSSL) means Alpine's
     usual glibc/OpenSSL payoff does not apply here.
 
+### Login throttling
+
+The login form slows repeated submissions automatically. After too many
+attempts, it asks the visitor to wait before trying again; normal
+browsing is unaffected.
+
+| Variable                   | Default | Description                                        |
+| -------------------------- | ------- | -------------------------------------------------- |
+| `MBA_LOGIN_THROTTLE_RATE`  | `1.0`   | Login attempts per second after the initial burst. |
+| `MBA_LOGIN_THROTTLE_BURST` | `10`    | Login attempts allowed before waiting.             |
+| `MBA_TRUSTED_PROXY_IPS`    | Empty   | Comma-separated IPs or CIDRs to treat as proxies.  |
+
+Behind a proxy, everyone shares one login limit by default. Set
+`MBA_TRUSTED_PROXY_IPS` to your proxy's IP to apply limits per visitor
+IP instead. This trusts its `X-Forwarded-For` header, which is otherwise
+ignored because clients can forge it.
+
+This only limits the login form. Guesses sent as session cookies bypass
+it, so use a strong password and rate-limit public traffic at the edge.
+
 ### Template
 
-| Variable                                | Default           | Description                               |
-| --------------------------------------- | ----------------- | ----------------------------------------- |
-| `MBA_TEMPLATE_FILE`                     | Built-in page     | Path to custom password-page HTML.        |
-| `MBA_TEMPLATE_PAGE_LANGUAGE`            | `en`              | Document language used by assistive tech. |
-| `MBA_TEMPLATE_PAGE_TITLE`               | `Welcome!`        | Browser tab title.                        |
-| `MBA_TEMPLATE_ICON`                     | Lucide lock SVG   | Complete icon HTML fragment.              |
-| `MBA_TEMPLATE_PASSWORD_LABEL`\*         | `Password`        | Accessible password-field label.          |
-| `MBA_TEMPLATE_PASSWORD_PLACEHOLDER`     | `password`        | Visible password-field placeholder.       |
-| `MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE`\* | `Wrong password.` | Accessible failed-login message.          |
-| `MBA_TEMPLATE_SUBMIT_BUTTON_TEXT`       | `Enter`           | Submit-button text.                       |
+| Variable                                | Default                                        | Description                               |
+| --------------------------------------- | ---------------------------------------------- | ----------------------------------------- |
+| `MBA_TEMPLATE_FILE`                     | Built-in page                                  | Path to custom password-page HTML.        |
+| `MBA_TEMPLATE_PAGE_LANGUAGE`            | `en`                                           | Document language used by assistive tech. |
+| `MBA_TEMPLATE_PAGE_TITLE`               | `Welcome!`                                     | Browser tab title.                        |
+| `MBA_TEMPLATE_ICON`                     | Lucide lock SVG                                | Complete icon HTML fragment.              |
+| `MBA_TEMPLATE_PASSWORD_LABEL`\*         | `Password`                                     | Accessible password-field label.          |
+| `MBA_TEMPLATE_PASSWORD_PLACEHOLDER`     | `password`                                     | Visible password-field placeholder.       |
+| `MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE`\* | `Wrong password.`                              | Accessible failed-login message.          |
+| `MBA_TEMPLATE_THROTTLED_MESSAGE`        | `Too many attempts. Please try again shortly.` | Visible and accessible retry message.     |
+| `MBA_TEMPLATE_SUBMIT_BUTTON_TEXT`       | `Enter`                                        | Submit-button text.                       |
 
 \* In the built-in page these are announced to assistive technologies
 only and not shown visually — sighted users see the placeholder and, on
@@ -301,6 +318,8 @@ environment:
   MBA_TEMPLATE_PASSWORD_LABEL: "Mot de passe"
   MBA_TEMPLATE_PASSWORD_PLACEHOLDER: "mot de passe"
   MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE: "Mot de passe incorrect."
+  MBA_TEMPLATE_THROTTLED_MESSAGE:
+    "Trop de tentatives. Réessayez dans quelques instants."
   MBA_TEMPLATE_SUBMIT_BUTTON_TEXT: "Entrer"
 ```
 
@@ -326,6 +345,9 @@ UID `10001`. It is loaded once at startup, so changes require a restart.
 Its `{{...}}` markers, and how each one renders, are documented inline
 in the file.
 
+Include `{{THROTTLED_MESSAGE}}` to explain when a login is throttled.
+Existing templates without it still work but show no retry message.
+
 Text marker values are escaped only for HTML text and quoted
 attributes—not JavaScript, CSS, or URLs. `{{ICON}}` is inserted
 verbatim. Custom HTML is public before authentication: keep it
@@ -347,7 +369,6 @@ small. Planned next:
 - **Config beyond env vars:** an env file or a YAML config file (via
   `MBA_CONFIG_FILE` or discovery).
 - **More settings:** auth method, logging on/off, session lifetime.
-- **Authentication hardening:** optional failed-login throttling.
 
 ### Non-goals
 

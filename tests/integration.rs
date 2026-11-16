@@ -8,6 +8,7 @@
 // Transitive duplicate crate versions only (see `lib.rs`).
 #![allow(clippy::multiple_crate_versions)]
 
+use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -575,7 +576,10 @@ fn template_file_customizes_every_wall_response() {
     let template = TemporaryTemplate::new(
         b"<!doctype html><title>{{PAGE_TITLE}}</title><p>CUSTOM_TEMPLATE</p>",
     );
-    let gate = TemplateGate::spawn(template.path(), PASSWORD);
+    let gate = BinaryGate::spawn(
+        PASSWORD,
+        &[("MBA_TEMPLATE_FILE", template.path().as_os_str())],
+    );
 
     let get_response = gate.get();
     let post_response = gate.post_password("wrong", "/");
@@ -594,7 +598,10 @@ fn template_file_customizes_every_wall_response() {
 #[test]
 fn password_field_authenticates_with_a_custom_template_configured() {
     let template = TemporaryTemplate::new(b"<p>CUSTOM_TEMPLATE</p>");
-    let gate = TemplateGate::spawn(template.path(), PASSWORD);
+    let gate = BinaryGate::spawn(
+        PASSWORD,
+        &[("MBA_TEMPLATE_FILE", template.path().as_os_str())],
+    );
 
     let response = gate.post_password(PASSWORD, "/private?section=docs");
 
@@ -606,7 +613,10 @@ fn password_field_authenticates_with_a_custom_template_configured() {
 #[test]
 fn template_file_is_loaded_only_at_startup() {
     let template = TemporaryTemplate::new(b"<p>VERSION_ONE</p>");
-    let gate = TemplateGate::spawn(template.path(), PASSWORD);
+    let gate = BinaryGate::spawn(
+        PASSWORD,
+        &[("MBA_TEMPLATE_FILE", template.path().as_os_str())],
+    );
 
     template.overwrite(b"<p>VERSION_TWO</p>");
     let changed_response = gate.get();
@@ -627,7 +637,10 @@ fn non_unicode_template_file_path_is_supported() {
     else {
         return;
     };
-    let gate = TemplateGate::spawn(template.path(), PASSWORD);
+    let gate = BinaryGate::spawn(
+        PASSWORD,
+        &[("MBA_TEMPLATE_FILE", template.path().as_os_str())],
+    );
 
     let response = gate.get();
 
@@ -656,6 +669,230 @@ fn missing_template_file_fails_fast() {
     );
 }
 
+// --- Failed-login throttling (child process) -----------------------------
+
+#[test]
+fn login_throttle_returns_retry_response_after_configured_burst() {
+    let gate = BinaryGate::spawn_throttled(2, &[]);
+    let started = std::time::Instant::now();
+    for _ in 0..2 {
+        assert!(
+            gate.post_password("wrong", "/")
+                .starts_with("HTTP/1.1 401 Unauthorized")
+        );
+    }
+
+    let response = gate.post_password("wrong", "/");
+
+    assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
+    assert_eq!(
+        response_header(&response, "cache-control"),
+        Some("no-store")
+    );
+    assert_eq!(
+        response_header(&response, "content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    let retry: u64 = response_header(&response, "retry-after")
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Allow elapsed request time while proving the configured rate
+    // reaches the limiter; a default-rate retry of one must not pass.
+    let elapsed = started.elapsed().as_secs().saturating_add(1);
+    assert!((1_000_000_u64.saturating_sub(elapsed)..=1_000_000).contains(&retry));
+    let body = response_body(&response);
+    assert!(body.contains("Too many attempts. Please try again shortly."));
+    assert!(body.contains("aria-invalid=\"false\""));
+    assert!(!body.contains("Wrong password."));
+}
+
+#[test]
+fn login_throttle_rejects_correct_password_across_paths_and_passwords() {
+    let gate = BinaryGate::spawn_throttled(1, &[("MBA_PASSWORD_OTHER", OsStr::new("swordfish"))]);
+    assert!(
+        gate.post_password("wrong", "/first")
+            .starts_with("HTTP/1.1 401 Unauthorized")
+    );
+
+    let response = gate.post_password("swordfish", "/second?view=private");
+
+    assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
+    assert!(response_header(&response, "set-cookie").is_none());
+    assert!(response_header(&response, "location").is_none());
+}
+
+#[test]
+fn login_throttle_success_clears_prior_failures() {
+    let gate = BinaryGate::spawn_throttled(3, &[]);
+    for _ in 0..2 {
+        assert!(
+            gate.post_password("wrong", "/")
+                .starts_with("HTTP/1.1 401 Unauthorized")
+        );
+    }
+    assert!(
+        gate.post_password(PASSWORD, "/")
+            .starts_with("HTTP/1.1 303 See Other")
+    );
+
+    for _ in 0..3 {
+        assert!(
+            gate.post_password("wrong", "/")
+                .starts_with("HTTP/1.1 401 Unauthorized")
+        );
+    }
+    assert!(
+        gate.post_password("wrong", "/")
+            .starts_with("HTTP/1.1 429 Too Many Requests")
+    );
+}
+
+#[test]
+fn login_throttle_trusted_clients_have_independent_buckets() {
+    let gate =
+        BinaryGate::spawn_throttled(1, &[("MBA_TRUSTED_PROXY_IPS", OsStr::new("127.0.0.1"))]);
+    for client in ["203.0.113.1", "203.0.113.2"] {
+        let response =
+            gate.post_password_with_headers("wrong", "/", &[("X-Forwarded-For", client)]);
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+    }
+
+    let response =
+        gate.post_password_with_headers("wrong", "/", &[("X-Forwarded-For", "203.0.113.1")]);
+
+    assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
+}
+
+#[test]
+fn login_throttle_traverses_trusted_proxy_chain() {
+    let gate = BinaryGate::spawn_throttled(
+        1,
+        &[("MBA_TRUSTED_PROXY_IPS", OsStr::new("127.0.0.1,10.0.0.0/8"))],
+    );
+    let response = gate.post_password_with_headers(
+        "wrong",
+        "/",
+        &[
+            ("X-Forwarded-For", "192.0.2.99,203.0.113.42"),
+            ("X-Forwarded-For", "10.0.0.2"),
+        ],
+    );
+    assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+
+    // A direct report of the selected sender must reuse its allowance;
+    // neither the unverified left hop nor the trusted proxy is the key.
+    let response =
+        gate.post_password_with_headers("wrong", "/", &[("X-Forwarded-For", "203.0.113.42")]);
+
+    assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
+}
+
+#[test]
+fn login_throttle_ignores_untrusted_forwarding_headers() {
+    let gate = BinaryGate::spawn_throttled(1, &[]);
+    let response =
+        gate.post_password_with_headers("wrong", "/", &[("X-Forwarded-For", "203.0.113.1")]);
+    assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+
+    let response =
+        gate.post_password_with_headers("wrong", "/", &[("X-Forwarded-For", "203.0.113.2")]);
+
+    assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
+}
+
+#[test]
+fn login_throttle_unknown_forwarded_clients_share_one_bucket() {
+    let gate =
+        BinaryGate::spawn_throttled(1, &[("MBA_TRUSTED_PROXY_IPS", OsStr::new("127.0.0.1"))]);
+    assert!(
+        gate.post_password("wrong", "/")
+            .starts_with("HTTP/1.1 401 Unauthorized")
+    );
+
+    let malformed =
+        gate.post_password_with_headers("wrong", "/", &[("X-Forwarded-For", "not-an-ip")]);
+    let known =
+        gate.post_password_with_headers("wrong", "/", &[("X-Forwarded-For", "203.0.113.1")]);
+
+    assert!(malformed.starts_with("HTTP/1.1 429 Too Many Requests"));
+    assert!(known.starts_with("HTTP/1.1 401 Unauthorized"));
+}
+
+#[test]
+fn login_throttle_groups_native_ipv6_clients_by_64() {
+    let gate =
+        BinaryGate::spawn_throttled(1, &[("MBA_TRUSTED_PROXY_IPS", OsStr::new("127.0.0.1"))]);
+    let first =
+        gate.post_password_with_headers("wrong", "/", &[("X-Forwarded-For", "2001:db8:1:2::1")]);
+    let same_network =
+        gate.post_password_with_headers("wrong", "/", &[("X-Forwarded-For", "2001:db8:1:2::ffff")]);
+    let other_network =
+        gate.post_password_with_headers("wrong", "/", &[("X-Forwarded-For", "2001:db8:1:3::1")]);
+
+    assert!(first.starts_with("HTTP/1.1 401 Unauthorized"));
+    assert!(same_network.starts_with("HTTP/1.1 429 Too Many Requests"));
+    assert!(other_network.starts_with("HTTP/1.1 401 Unauthorized"));
+}
+
+#[test]
+fn login_throttle_message_override_reaches_the_response() {
+    let gate = BinaryGate::spawn_throttled(
+        1,
+        &[(
+            "MBA_TEMPLATE_THROTTLED_MESSAGE",
+            OsStr::new("<Retry & later>"),
+        )],
+    );
+    assert!(
+        gate.post_password("wrong", "/")
+            .starts_with("HTTP/1.1 401 Unauthorized")
+    );
+
+    let response = gate.post_password("wrong", "/");
+
+    assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
+    assert!(response_body(&response).contains("&lt;Retry &amp; later&gt;"));
+    assert!(!response_body(&response).contains("<Retry & later>"));
+}
+
+#[test]
+fn login_throttle_custom_template_distinguishes_unchecked_password() {
+    let template = TemporaryTemplate::new(
+        b"<p>{{THROTTLED_MESSAGE}}</p><span>{{WRONG_PASSWORD_MESSAGE}}</span>",
+    );
+    let gate = BinaryGate::spawn_throttled(
+        1,
+        &[
+            ("MBA_TEMPLATE_FILE", template.path().as_os_str()),
+            ("MBA_TEMPLATE_THROTTLED_MESSAGE", OsStr::new("Try later.")),
+        ],
+    );
+    let wrong = gate.post_password("wrong", "/");
+    assert_eq!(response_body(&wrong), "<p></p><span>Wrong password.</span>");
+
+    let response = gate.post_password("wrong", "/");
+
+    assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
+    assert_eq!(response_body(&response), "<p>Try later.</p><span></span>");
+}
+
+#[test]
+fn login_throttle_keeps_custom_templates_without_new_markers() {
+    let template = TemporaryTemplate::new(b"<p>CUSTOM_TEMPLATE</p>");
+    let gate =
+        BinaryGate::spawn_throttled(1, &[("MBA_TEMPLATE_FILE", template.path().as_os_str())]);
+    assert!(
+        gate.post_password("wrong", "/")
+            .starts_with("HTTP/1.1 401 Unauthorized")
+    );
+
+    let response = gate.post_password("wrong", "/");
+
+    assert!(response.starts_with("HTTP/1.1 429 Too Many Requests"));
+    assert_eq!(response_body(&response), "<p>CUSTOM_TEMPLATE</p>");
+}
+
 /// Send one blocking request to a child-process gate, returning its full
 /// response when the listener is available.
 fn blocking_request(address: std::net::SocketAddr, request: &str) -> Option<String> {
@@ -675,6 +912,20 @@ fn blocking_request(address: std::net::SocketAddr, request: &str) -> Option<Stri
 /// The response body after the HTTP header block.
 fn response_body(response: &str) -> &str {
     response.split_once("\r\n\r\n").unwrap().1
+}
+
+/// Find one response header without matching text from the HTML body.
+fn response_header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+    response
+        .split_once("\r\n\r\n")
+        .unwrap()
+        .0
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            header.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
 }
 
 /// A custom template file removed when its test ends.
@@ -749,15 +1000,28 @@ fn unique_template_name() -> String {
     )
 }
 
-/// A child-process gate configured with a custom template.
-struct TemplateGate {
+/// A child-process gate configured through explicit environment values.
+struct BinaryGate {
     address: std::net::SocketAddr,
     child: std::process::Child,
 }
 
-impl TemplateGate {
-    /// Start the binary and wait until it serves the custom wall.
-    fn spawn(template_path: &std::path::Path, password: &str) -> Self {
+impl BinaryGate {
+    /// Start a gate whose refill cannot affect these short request tests.
+    /// Exact refill timing is exercised with explicit instants in unit
+    /// tests, rather than depending on child-process scheduling here.
+    fn spawn_throttled(burst: u32, environment: &[(&str, &OsStr)]) -> Self {
+        let burst = burst.to_string();
+        let mut variables = vec![
+            ("MBA_LOGIN_THROTTLE_RATE", OsStr::new("0.000001")),
+            ("MBA_LOGIN_THROTTLE_BURST", OsStr::new(&burst)),
+        ];
+        variables.extend_from_slice(environment);
+        Self::spawn(PASSWORD, &variables)
+    }
+
+    /// Start the binary and wait until it serves the configured wall.
+    fn spawn(password: &str, environment: &[(&str, &OsStr)]) -> Self {
         let mut failures = Vec::new();
 
         // Retry if another process wins the allocation-to-bind gap.
@@ -770,7 +1034,7 @@ impl TemplateGate {
                 .env("MBA_ADDRESS", address.to_string())
                 .env("MBA_PASSWORD", password)
                 .env("MBA_UPSTREAM", "http://127.0.0.1:9")
-                .env("MBA_TEMPLATE_FILE", template_path)
+                .envs(environment.iter().copied())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -798,7 +1062,7 @@ impl TemplateGate {
         }
 
         panic!(
-            "service did not serve the custom template after five attempts:\n{}",
+            "service did not serve the configured wall after five attempts:\n{}",
             failures.join("\n")
         );
     }
@@ -810,11 +1074,28 @@ impl TemplateGate {
 
     /// Submit a form-encoded `password` field to `target`.
     fn post_password(&self, password: &str, target: &str) -> String {
+        self.post_password_with_headers(password, target, &[])
+    }
+
+    /// Submit a password with explicit headers, preserving repeated fields.
+    fn post_password_with_headers(
+        &self,
+        password: &str,
+        target: &str,
+        headers: &[(&str, &str)],
+    ) -> String {
         let body = login_body(password);
+        let mut extra_headers = String::new();
+        for (name, value) in headers {
+            extra_headers.push_str(name);
+            extra_headers.push_str(": ");
+            extra_headers.push_str(value);
+            extra_headers.push_str("\r\n");
+        }
         let request = format!(
             "POST {target} HTTP/1.1\r\nHost: {}\r\n\
              Content-Type: application/x-www-form-urlencoded\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+             Content-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
             self.address,
             body.len(),
         );
@@ -827,7 +1108,7 @@ impl TemplateGate {
     }
 }
 
-impl Drop for TemplateGate {
+impl Drop for BinaryGate {
     fn drop(&mut self) {
         _ = self.child.kill();
         _ = self.child.wait();
@@ -931,6 +1212,73 @@ fn non_unicode_trusted_proxy_configuration_fails_before_binding() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("MBA_TRUSTED_PROXY_IPS"), "stderr: {stderr}");
     assert!(stderr.contains("Unicode"), "stderr: {stderr}");
+}
+
+#[test]
+fn login_throttle_invalid_rate_fails_before_binding() {
+    // Occupying the port bounds the test even if validation is skipped.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let output = binary_without_mba_environment()
+        .env("MBA_ADDRESS", listener.local_addr().unwrap().to_string())
+        .env("MBA_PASSWORD", PASSWORD)
+        .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+        .env("MBA_LOGIN_THROTTLE_RATE", "0")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MBA_LOGIN_THROTTLE_RATE"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn login_throttle_invalid_burst_fails_before_binding() {
+    // Occupying the port bounds the test even if validation is skipped.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let output = binary_without_mba_environment()
+        .env("MBA_ADDRESS", listener.local_addr().unwrap().to_string())
+        .env("MBA_PASSWORD", PASSWORD)
+        .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+        .env("MBA_LOGIN_THROTTLE_BURST", "0")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MBA_LOGIN_THROTTLE_BURST"),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn login_throttle_non_unicode_configuration_fails_before_binding() {
+    use std::os::unix::ffi::OsStringExt;
+
+    // Each new environment path must reject unusable text before bind.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    for variable in [
+        "MBA_LOGIN_THROTTLE_RATE",
+        "MBA_LOGIN_THROTTLE_BURST",
+        "MBA_TEMPLATE_THROTTLED_MESSAGE",
+    ] {
+        let output = binary_without_mba_environment()
+            .env("MBA_ADDRESS", listener.local_addr().unwrap().to_string())
+            .env("MBA_PASSWORD", PASSWORD)
+            .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+            .env(variable, std::ffi::OsString::from_vec(vec![0xff]))
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(variable), "stderr: {stderr}");
+        assert!(stderr.contains("Unicode"), "stderr: {stderr}");
+    }
 }
 
 #[test]

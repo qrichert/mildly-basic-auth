@@ -15,6 +15,8 @@
   - `PASSWORD_PLACEHOLDER`: Password-field placeholder.
   - `WRONG_PASSWORD_MESSAGE`: Error text after a failed login and blank
     otherwise (screen-reader-only in this template).
+  - `THROTTLED_MESSAGE`: Visible text when a login attempt was not checked
+    because too many attempts were submitted; blank otherwise.
   - `SUBMIT_BUTTON_TEXT`: Form submit button text.
 
   Generated login-state placeholders are set internally:
@@ -22,7 +24,9 @@
   - `_IS_PASSWORD_INVALID`: Literal `true` after a failed login and
     `false` otherwise.
   - `_PASSWORD_AUTOFOCUS_ATTRIBUTE`: Complete `autofocus` attribute
-    after a failed login and blank otherwise.
+    after a wrong or throttled login and blank otherwise.
+  - `_THROTTLED_HIDDEN_ATTRIBUTE`: Complete `hidden` attribute unless the
+    login attempt was throttled; blank when the message should be shown.
 
   Templates may omit any placeholder. Unknown placeholders are preserved
   unchanged.
@@ -235,6 +239,14 @@
         box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring), transparent 50%);
       }
 
+      .throttled-message {
+        margin: 0;
+        color: var(--foreground);
+        font-size: 0.875rem;
+        line-height: 1.5rem;
+        text-align: center;
+      }
+
       .sr-only {
         position: absolute;
         width: 1px;
@@ -294,9 +306,9 @@
             <label class="sr-only" for="password">{{PASSWORD_LABEL}}</label>
             <!--
               The `_PASSWORD_AUTOFOCUS_ATTRIBUTE` placeholder below
-              renders the complete `autofocus` attribute after a failed
-              login and nothing otherwise. Leave it standalone because
-              `autofocus=""` still enables autofocus.
+              renders the complete `autofocus` attribute after a wrong
+              or throttled login and nothing otherwise. Keep it
+              standalone: `autofocus=""` still enables autofocus.
             -->
             <input
               class="input"
@@ -305,7 +317,7 @@
               name="password"
               placeholder="{{PASSWORD_PLACEHOLDER}}"
               autocomplete="current-password"
-              aria-describedby="password-error"
+              aria-describedby="password-error throttled-message"
               aria-invalid="{{_IS_PASSWORD_INVALID}}"
               {{_PASSWORD_AUTOFOCUS_ATTRIBUTE}}
               required
@@ -340,6 +352,19 @@
               {{WRONG_PASSWORD_MESSAGE}}
             </span>
           </div>
+          <!--
+            A throttled password was not checked. Explain the retry
+            without marking the field invalid, and hide the inactive
+            message from both layout and assistive technology.
+          -->
+          <p
+            class="throttled-message"
+            id="throttled-message"
+            role="alert"
+            {{_THROTTLED_HIDDEN_ATTRIBUTE}}
+          >
+            {{THROTTLED_MESSAGE}}
+          </p>
           <button class="button" type="submit">{{SUBMIT_BUTTON_TEXT}}</button>
         </form>
       </div>

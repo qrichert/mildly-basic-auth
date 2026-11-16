@@ -40,8 +40,16 @@ const DEFAULT_TEMPLATE_ICON: &str = r#"<!-- Lock icon from Lucide (https://lucid
         </svg>"#;
 /// Default IP socket address the service listens on.
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8000";
+/// Refill once per second without prolonged shared-IP lockouts.
+const DEFAULT_LOGIN_THROTTLE_RATE: f64 = 1.0;
+/// Allow ordinary password retries before slowing sustained guessing.
+const DEFAULT_LOGIN_THROTTLE_BURST: u32 = 10;
 /// Environment variable holding the IP socket address to listen on.
 const ENV_ADDRESS: &str = "MBA_ADDRESS";
+/// Environment variable setting replenished login attempts per second.
+const ENV_LOGIN_THROTTLE_RATE: &str = "MBA_LOGIN_THROTTLE_RATE";
+/// Environment variable setting the maximum immediate login attempts.
+const ENV_LOGIN_THROTTLE_BURST: &str = "MBA_LOGIN_THROTTLE_BURST";
 /// Environment variable holding a plain password. At least one of the
 /// `MBA_PASSWORD*` family (this or a `MBA_PASSWORD_<label>`) must be
 /// non-empty.
@@ -52,7 +60,7 @@ const ENV_PASSWORD: &str = "MBA_PASSWORD";
 /// not land under `MBA_PASSWORD_*` or it would be read as a password.
 const ENV_PASSWORD_PREFIX: &str = "MBA_PASSWORD_";
 /// Environment variable holding an optional custom password-page template
-/// path. The file is read once and both login states render at startup.
+/// path. The file is read once and all login states render at startup.
 const ENV_TEMPLATE_FILE: &str = "MBA_TEMPLATE_FILE";
 /// Environment variable overriding the password page's document language.
 const ENV_TEMPLATE_PAGE_LANGUAGE: &str = "MBA_TEMPLATE_PAGE_LANGUAGE";
@@ -71,6 +79,9 @@ const ENV_TEMPLATE_PASSWORD_PLACEHOLDER: &str = "MBA_TEMPLATE_PASSWORD_PLACEHOLD
 /// border); a custom template may render `{{WRONG_PASSWORD_MESSAGE}}`
 /// wherever it likes.
 const ENV_TEMPLATE_WRONG_PASSWORD_MESSAGE: &str = "MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE";
+/// Environment variable overriding the visible message when a login
+/// attempt is throttled without checking its password.
+const ENV_TEMPLATE_THROTTLED_MESSAGE: &str = "MBA_TEMPLATE_THROTTLED_MESSAGE";
 /// Environment variable overriding the submit button's text.
 const ENV_TEMPLATE_SUBMIT_BUTTON_TEXT: &str = "MBA_TEMPLATE_SUBMIT_BUTTON_TEXT";
 /// Environment variable listing IP addresses and CIDRs allowed to supply
@@ -100,6 +111,10 @@ pub struct Config {
     /// below). This is not memory scrubbing — the plaintext still lives in
     /// the process environment.
     sessions: Vec<Hash>,
+    /// Positive, finite refill rate with a representable retry delay.
+    login_throttle_rate: f64,
+    /// Positive capacity with an exact `f64` token count.
+    login_throttle_burst: u32,
     /// Normalized proxy networks allowed to supply forwarded identity.
     /// Empty by default, requiring explicit trust configuration.
     trusted_proxy_cidrs: Vec<IpNet>,
@@ -114,6 +129,8 @@ pub struct Config {
     wall: Bytes,
     /// The same password-page template rendered with a failed-login error.
     wrong_password_wall: Bytes,
+    /// Password page explaining that a login attempt was not checked.
+    throttled_wall: Bytes,
 }
 
 impl Config {
@@ -127,6 +144,7 @@ impl Config {
     /// IP socket address, no `MBA_PASSWORD*` variable has a non-empty
     /// UTF-8 value, two of them share the same value, a custom template
     /// file is unusable, a template override is not valid Unicode,
+    /// a login-throttle setting is invalid or out of range,
     /// `MBA_TRUSTED_PROXY_IPS` is not a valid Unicode list of IP
     /// addresses or CIDRs, or `MBA_UPSTREAM` is not a valid absolute
     /// HTTP(S) URL.
@@ -147,6 +165,10 @@ impl Config {
         let template = custom_template.as_deref().unwrap_or(WALL_TEMPLATE);
         let template_values = TemplateValues::from_env(std::env::vars_os())?;
         let upstream = std::env::var(ENV_UPSTREAM).unwrap_or_default();
+        let login_throttle_rate =
+            parse_login_throttle_rate(std::env::var_os(ENV_LOGIN_THROTTLE_RATE))?;
+        let login_throttle_burst =
+            parse_login_throttle_burst(std::env::var_os(ENV_LOGIN_THROTTLE_BURST))?;
         let trusted_proxy_cidrs =
             parse_trusted_proxy_cidrs(std::env::var_os(ENV_TRUSTED_PROXY_IPS))?;
         let mut config = Self::from_passwords_address_template_and_values(
@@ -157,6 +179,8 @@ impl Config {
             &template_values,
         )?;
         config.trusted_proxy_cidrs = trusted_proxy_cidrs;
+        config.login_throttle_rate = login_throttle_rate;
+        config.login_throttle_burst = login_throttle_burst;
         Ok(config)
     }
 
@@ -271,15 +295,20 @@ impl Config {
             .collect();
         let upstream = validate_upstream(upstream)?;
         let address = validate_address(address)?;
-        let wall = render_template(template, template_values, false);
-        let wrong_password_wall = render_template(template, template_values, true);
+        let wall = render_template(template, template_values, LoginState::Neutral);
+        let wrong_password_wall =
+            render_template(template, template_values, LoginState::WrongPassword);
+        let throttled_wall = render_template(template, template_values, LoginState::Throttled);
         Ok(Self {
             bind_address: address,
             sessions,
+            login_throttle_rate: DEFAULT_LOGIN_THROTTLE_RATE,
+            login_throttle_burst: DEFAULT_LOGIN_THROTTLE_BURST,
             trusted_proxy_cidrs: Vec::new(),
             upstream,
             wall,
             wrong_password_wall,
+            throttled_wall,
         })
     }
 
@@ -289,11 +318,17 @@ impl Config {
         &self.sessions
     }
 
+    /// Validated number of login attempts replenished per second.
+    pub(crate) fn login_throttle_rate(&self) -> f64 {
+        self.login_throttle_rate
+    }
+
+    /// Validated maximum of immediately available login attempts.
+    pub(crate) fn login_throttle_burst(&self) -> u32 {
+        self.login_throttle_burst
+    }
+
     /// Networks explicitly trusted to supply forwarded client identity.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Pending throttling and allowlist consumers.")
-    )]
     pub(crate) fn trusted_proxy_cidrs(&self) -> &[IpNet] {
         &self.trusted_proxy_cidrs
     }
@@ -312,6 +347,11 @@ impl Config {
     pub(crate) fn wrong_password_wall(&self) -> &Bytes {
         &self.wrong_password_wall
     }
+
+    /// Rendered password page with the throttled-login message visible.
+    pub(crate) fn throttled_wall(&self) -> &Bytes {
+        &self.throttled_wall
+    }
 }
 
 impl fmt::Debug for Config {
@@ -321,12 +361,68 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("bind_address", &self.bind_address)
             .field("sessions", &"<redacted>")
+            .field("login_throttle_rate", &self.login_throttle_rate)
+            .field("login_throttle_burst", &self.login_throttle_burst)
             .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .field("upstream", &self.upstream)
             .field("wall", &"<rendered HTML>")
             .field("wrong_password_wall", &"<rendered HTML>")
+            .field("throttled_wall", &"<rendered HTML>")
             .finish()
     }
+}
+
+/// Parse positive attempts per second with a representable retry delay.
+///
+/// Unset uses the default; empty or invalid values fail startup.
+/// For example, `" 0.5 "` becomes `0.5`: one refill per two seconds.
+fn parse_login_throttle_rate(value: Option<OsString>) -> Result<f64, ConfigError> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_LOGIN_THROTTLE_RATE);
+    };
+    let invalid = |reason| ConfigError::InvalidLoginThrottleRate { reason };
+    let value = value
+        .into_string()
+        .map_err(|_| invalid("must contain valid Unicode"))?;
+    let rate = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| invalid("must be a positive, finite number of attempts per second"))?;
+    if !rate.is_finite() || rate <= 0.0 {
+        return Err(invalid(
+            "must be a positive, finite number of attempts per second",
+        ));
+    }
+    // `u64::MAX` rounds up to 2^64 in `f64`, so that exact boundary
+    // must be excluded before retry seconds are converted to `u64`.
+    if (1.0 / rate).ceil() >= 18_446_744_073_709_551_616.0 {
+        return Err(invalid(
+            "is too small: the rounded-up retry delay must be less than 18446744073709551616 seconds",
+        ));
+    }
+    Ok(rate)
+}
+
+/// Parse a positive burst capacity that remains exactly countable.
+///
+/// Unset uses the default. For example, `" 20 "` becomes `20`; zero and
+/// values above `u32::MAX` fail without rounding or disabling limits.
+fn parse_login_throttle_burst(value: Option<OsString>) -> Result<u32, ConfigError> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_LOGIN_THROTTLE_BURST);
+    };
+    let invalid = |reason| ConfigError::InvalidLoginThrottleBurst { reason };
+    let value = value
+        .into_string()
+        .map_err(|_| invalid("must contain valid Unicode"))?;
+    let burst = value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| invalid("must be an integer between 1 and 4294967295"))?;
+    if burst == 0 {
+        return Err(invalid("must be an integer between 1 and 4294967295"));
+    }
+    Ok(burst)
 }
 
 /// Parse explicit proxy trust networks; unset or blank means no trust.
@@ -401,6 +497,7 @@ struct TemplateValues {
     password_label: String,
     password_placeholder: String,
     wrong_password_message: String,
+    throttled_message: String,
     submit_button_text: String,
 }
 
@@ -419,6 +516,7 @@ impl TemplateValues {
                 ENV_TEMPLATE_PASSWORD_LABEL => &mut values.password_label,
                 ENV_TEMPLATE_PASSWORD_PLACEHOLDER => &mut values.password_placeholder,
                 ENV_TEMPLATE_WRONG_PASSWORD_MESSAGE => &mut values.wrong_password_message,
+                ENV_TEMPLATE_THROTTLED_MESSAGE => &mut values.throttled_message,
                 ENV_TEMPLATE_SUBMIT_BUTTON_TEXT => &mut values.submit_button_text,
                 _ => continue,
             };
@@ -441,6 +539,7 @@ impl Default for TemplateValues {
             password_label: "Password".to_owned(),
             password_placeholder: "password".to_owned(),
             wrong_password_message: "Wrong password.".to_owned(),
+            throttled_message: "Too many attempts. Please try again shortly.".to_owned(),
             submit_button_text: "Enter".to_owned(),
         }
     }
@@ -470,22 +569,45 @@ fn load_custom_template(path: Option<OsString>) -> Result<Option<String>, Config
     Ok(Some(template))
 }
 
+/// Page states distinguish unchecked from wrong passwords.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoginState {
+    Neutral,
+    WrongPassword,
+    Throttled,
+}
+
 /// Render known markers from one template for the requested login state,
 /// preserving unknown or absent markers. Scanning only the original
 /// template ensures marker-like text in an override is not interpreted
 /// recursively.
-fn render_template(template: &str, values: &TemplateValues, wrong_password: bool) -> Bytes {
+fn render_template(template: &str, values: &TemplateValues, state: LoginState) -> Bytes {
     let mut rendered = String::with_capacity(template.len());
     let mut remaining = template;
+    let wrong_password = state == LoginState::WrongPassword;
     // String form of the invalid flag, for `aria-invalid`.
     let is_password_invalid = if wrong_password { "true" } else { "false" };
-    // Focus the field only on the error wall, so the failed-login state
-    // is announced immediately after submission (see `template.html`).
-    let autofocus_attribute = if wrong_password { "autofocus" } else { "" };
+    // Focus after a rejected submission so its explanation is announced
+    // through the field's accessible description (see `template.html`).
+    let autofocus_attribute = if state == LoginState::Neutral {
+        ""
+    } else {
+        "autofocus"
+    };
     let wrong_password_message = if wrong_password {
         values.wrong_password_message.as_str()
     } else {
         ""
+    };
+    let throttled_message = if state == LoginState::Throttled {
+        values.throttled_message.as_str()
+    } else {
+        ""
+    };
+    let throttled_hidden_attribute = if state == LoginState::Throttled {
+        ""
+    } else {
+        "hidden"
     };
 
     while let Some(marker_start) = remaining.find("{{") {
@@ -510,9 +632,14 @@ fn render_template(template: &str, values: &TemplateValues, wrong_password: bool
                 values.password_placeholder.as_str(),
             ),
             ("{{WRONG_PASSWORD_MESSAGE}}", wrong_password_message),
+            ("{{THROTTLED_MESSAGE}}", throttled_message),
             ("{{SUBMIT_BUTTON_TEXT}}", values.submit_button_text.as_str()),
             ("{{_IS_PASSWORD_INVALID}}", is_password_invalid),
             ("{{_PASSWORD_AUTOFOCUS_ATTRIBUTE}}", autofocus_attribute),
+            (
+                "{{_THROTTLED_HIDDEN_ATTRIBUTE}}",
+                throttled_hidden_attribute,
+            ),
         ]
         .into_iter()
         .find(|(marker, _)| remaining.starts_with(marker));
@@ -663,6 +790,10 @@ fn validate_upstream(upstream: &str) -> Result<String, ConfigError> {
 pub enum ConfigError {
     /// `MBA_ADDRESS` was not a valid non-zero IP socket address.
     InvalidAddress { value: String, reason: &'static str },
+    /// The rate was invalid or could not produce a bounded retry delay.
+    InvalidLoginThrottleRate { reason: &'static str },
+    /// The burst was not a positive integer representable as `u32`.
+    InvalidLoginThrottleBurst { reason: &'static str },
     /// No `MBA_PASSWORD*` variable had a non-empty UTF-8 value.
     MissingPassword,
     /// Two `MBA_PASSWORD*` variables shared the same value, which would
@@ -688,6 +819,12 @@ impl fmt::Display for ConfigError {
                 f,
                 "`{ENV_ADDRESS}` is not a valid IP socket address ({reason}): {value:?}"
             ),
+            Self::InvalidLoginThrottleRate { reason } => {
+                write!(f, "`{ENV_LOGIN_THROTTLE_RATE}` {reason}")
+            }
+            Self::InvalidLoginThrottleBurst { reason } => {
+                write!(f, "`{ENV_LOGIN_THROTTLE_BURST}` {reason}")
+            }
             Self::MissingPassword => write!(
                 f,
                 "at least one password variable (`{ENV_PASSWORD}` or \
@@ -762,6 +899,138 @@ mod tests {
                 .map(|(name, value)| (OsString::from(name), OsString::from(value))),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn unset_login_throttle_rate_uses_the_default() {
+        assert_eq!(
+            parse_login_throttle_rate(None).unwrap().to_bits(),
+            1.0_f64.to_bits(),
+        );
+    }
+
+    #[test]
+    fn login_throttle_rate_accepts_positive_finite_values() {
+        for (value, expected) in [
+            (" 0.5 \n", 0.5_f64),
+            ("2e3", 2000.0),
+            ("1.7976931348623157e308", f64::MAX),
+        ] {
+            assert_eq!(
+                parse_login_throttle_rate(Some(value.into()))
+                    .unwrap()
+                    .to_bits(),
+                expected.to_bits(),
+            );
+        }
+    }
+
+    #[test]
+    fn login_throttle_rate_rejects_invalid_numbers() {
+        for value in [
+            "", " \t", "0", "-0", "-1", "NaN", "inf", "-inf", "1e309", "1e-999", "fast",
+        ] {
+            let error = parse_login_throttle_rate(Some(value.into())).unwrap_err();
+
+            assert_matches!(error, ConfigError::InvalidLoginThrottleRate { .. });
+            assert!(error.to_string().contains(ENV_LOGIN_THROTTLE_RATE));
+        }
+    }
+
+    #[test]
+    fn login_throttle_rate_requires_a_representable_retry_delay() {
+        // At 2^-64 attempts per second, even one token needs 2^64
+        // seconds. The next greater float has a representable delay.
+        let boundary = 2.0_f64.powi(-64);
+        let first_valid = boundary.next_up();
+        assert_eq!(
+            parse_login_throttle_rate(Some(first_valid.to_string().into()))
+                .unwrap()
+                .to_bits(),
+            first_valid.to_bits(),
+        );
+        for value in [boundary.to_string(), "5e-324".to_owned()] {
+            let error = parse_login_throttle_rate(Some(value.into())).unwrap_err();
+
+            assert_matches!(error, ConfigError::InvalidLoginThrottleRate { .. });
+            assert!(error.to_string().contains("retry delay"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_throttle_rate_rejects_non_unicode() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = parse_login_throttle_rate(Some(OsString::from_vec(vec![0xff]))).unwrap_err();
+
+        assert_matches!(error, ConfigError::InvalidLoginThrottleRate { .. });
+        assert!(error.to_string().contains(ENV_LOGIN_THROTTLE_RATE));
+        assert!(error.to_string().contains("Unicode"));
+    }
+
+    #[test]
+    fn unset_login_throttle_burst_uses_the_default() {
+        assert_eq!(parse_login_throttle_burst(None).unwrap(), 10);
+    }
+
+    #[test]
+    fn login_throttle_burst_accepts_positive_u32_values() {
+        for (value, expected) in [("1", 1), (" 20 \n", 20), ("4294967295", u32::MAX)] {
+            assert_eq!(
+                parse_login_throttle_burst(Some(value.into())).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn login_throttle_burst_rejects_invalid_numbers() {
+        for value in [
+            "",
+            " \t",
+            "0",
+            "-1",
+            "1.5",
+            "NaN",
+            "inf",
+            "1e3",
+            "4294967296",
+        ] {
+            let error = parse_login_throttle_burst(Some(value.into())).unwrap_err();
+
+            assert_matches!(error, ConfigError::InvalidLoginThrottleBurst { .. });
+            assert!(error.to_string().contains(ENV_LOGIN_THROTTLE_BURST));
+            assert!(error.to_string().contains("between 1 and 4294967295"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_throttle_burst_rejects_non_unicode() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = parse_login_throttle_burst(Some(OsString::from_vec(vec![0xff]))).unwrap_err();
+
+        assert_matches!(error, ConfigError::InvalidLoginThrottleBurst { .. });
+        assert!(error.to_string().contains(ENV_LOGIN_THROTTLE_BURST));
+        assert!(error.to_string().contains("Unicode"));
+    }
+
+    #[test]
+    fn single_password_constructor_enables_default_login_throttling() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+
+        assert_eq!(config.login_throttle_rate().to_bits(), 1.0_f64.to_bits());
+        assert_eq!(config.login_throttle_burst(), 10);
+    }
+
+    #[test]
+    fn multiple_password_constructor_enables_default_login_throttling() {
+        let config = Config::from_passwords(&["hunter2", "swordfish"], "http://app:2001").unwrap();
+
+        assert_eq!(config.login_throttle_rate().to_bits(), 1.0_f64.to_bits());
+        assert_eq!(config.login_throttle_burst(), 10);
     }
 
     #[test]
@@ -1036,6 +1305,54 @@ mod tests {
     }
 
     #[test]
+    fn throttled_wall_shows_a_visible_message() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.throttled_wall()).unwrap();
+        let message = &wall[wall.find("<p\n").unwrap()..];
+        let message = &message[..message.find("</p>").unwrap()];
+        let tag = &message[..message.find('>').unwrap()];
+
+        assert!(tag.contains("class=\"throttled-message\""));
+        assert!(!tag.contains("hidden"));
+        assert!(message.contains("Too many attempts. Please try again shortly."));
+    }
+
+    #[test]
+    fn throttled_wall_does_not_claim_the_password_was_wrong() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.throttled_wall()).unwrap();
+
+        assert!(wall.contains("aria-invalid=\"false\""));
+        assert!(!wall.contains("Wrong password."));
+    }
+
+    #[test]
+    fn throttled_wall_associates_the_message_with_the_focused_input() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        let wall = std::str::from_utf8(config.throttled_wall()).unwrap();
+        let input = &wall[wall.find("<input").unwrap()..];
+        let input = &input[..input.find('>').unwrap()];
+
+        assert!(input.contains("autofocus"));
+        assert!(input.contains("aria-describedby=\"password-error throttled-message\""));
+        assert!(wall.contains("id=\"throttled-message\""));
+        assert!(wall.contains("role=\"alert\""));
+    }
+
+    #[test]
+    fn other_wall_states_hide_the_throttled_message() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        for wall in [config.wall(), config.wrong_password_wall()] {
+            let wall = std::str::from_utf8(wall).unwrap();
+            let message = &wall[wall.find("<p\n").unwrap()..];
+            let tag = &message[..message.find('>').unwrap()];
+
+            assert!(tag.contains("hidden"));
+            assert!(!wall.contains("Too many attempts. Please try again shortly."));
+        }
+    }
+
+    #[test]
     fn default_wall_includes_the_lock_icon_glyph() {
         let config = Config::from_values("hunter2", "http://app:2001").unwrap();
         let wall = std::str::from_utf8(config.wall()).unwrap();
@@ -1191,6 +1508,47 @@ mod tests {
     }
 
     #[test]
+    fn throttled_message_variable_overrides_the_rendered_default() {
+        let values =
+            template_values_from_vars(&[(ENV_TEMPLATE_THROTTLED_MESSAGE, "Réessayez bientôt.")]);
+        let rendered = render_template("{{THROTTLED_MESSAGE}}", &values, LoginState::Throttled);
+
+        assert_eq!(rendered, "Réessayez bientôt.");
+    }
+
+    #[test]
+    fn empty_throttled_message_override_removes_the_text() {
+        let values = template_values_from_vars(&[(ENV_TEMPLATE_THROTTLED_MESSAGE, "")]);
+        let rendered = render_template(
+            "before{{THROTTLED_MESSAGE}}after",
+            &values,
+            LoginState::Throttled,
+        );
+
+        assert_eq!(rendered, "beforeafter");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_throttled_message_is_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let result = TemplateValues::from_env(
+            [(
+                OsString::from(ENV_TEMPLATE_THROTTLED_MESSAGE),
+                OsString::from_vec(vec![0xff]),
+            )]
+            .into_iter(),
+        );
+
+        let Err(error) = result else {
+            panic!("non-Unicode throttled message was accepted");
+        };
+        assert_matches!(error, ConfigError::InvalidTemplateText { variable }
+            if variable == ENV_TEMPLATE_THROTTLED_MESSAGE);
+    }
+
+    #[test]
     fn submit_button_text_variable_overrides_the_default() {
         let text = template_values_from_vars(&[(ENV_TEMPLATE_SUBMIT_BUTTON_TEXT, "Entrer")]);
         assert_eq!(text.submit_button_text, "Entrer");
@@ -1261,7 +1619,7 @@ mod tests {
             ..TemplateValues::default()
         };
 
-        let rendered = render_template("{{ICON}}", &values, false);
+        let rendered = render_template("{{ICON}}", &values, LoginState::Neutral);
 
         assert_eq!(rendered, r#"<svg aria-hidden="true"></svg>"#);
     }
@@ -1273,7 +1631,7 @@ mod tests {
             ..TemplateValues::default()
         };
 
-        let rendered = render_template("before{{ICON}}after", &values, false);
+        let rendered = render_template("before{{ICON}}after", &values, LoginState::Neutral);
 
         assert_eq!(rendered, "beforeafter");
     }
@@ -1286,7 +1644,7 @@ mod tests {
             ..TemplateValues::default()
         };
 
-        let rendered = render_template("{{ICON}}", &values, false);
+        let rendered = render_template("{{ICON}}", &values, LoginState::Neutral);
 
         assert_eq!(rendered, "{{PAGE_TITLE}}");
     }
@@ -1298,7 +1656,7 @@ mod tests {
             ..TemplateValues::default()
         };
 
-        let rendered = render_template("{{PAGE_TITLE}}", &text, false);
+        let rendered = render_template("{{PAGE_TITLE}}", &text, LoginState::Neutral);
 
         assert_eq!(rendered, "&amp;&lt;&gt;&quot;&#39;");
     }
@@ -1310,9 +1668,37 @@ mod tests {
             ..TemplateValues::default()
         };
 
-        let rendered = render_template("{{WRONG_PASSWORD_MESSAGE}}", &text, true);
+        let rendered = render_template(
+            "{{WRONG_PASSWORD_MESSAGE}}",
+            &text,
+            LoginState::WrongPassword,
+        );
 
         assert_eq!(rendered, "&amp;&lt;&gt;&quot;&#39;");
+    }
+
+    #[test]
+    fn throttled_message_is_html_escaped() {
+        let values = TemplateValues {
+            throttled_message: "&<>\"'".to_owned(),
+            ..TemplateValues::default()
+        };
+
+        let rendered = render_template("{{THROTTLED_MESSAGE}}", &values, LoginState::Throttled);
+
+        assert_eq!(rendered, "&amp;&lt;&gt;&quot;&#39;");
+    }
+
+    #[test]
+    fn throttled_message_is_not_rendered_recursively() {
+        let values = TemplateValues {
+            throttled_message: "{{WRONG_PASSWORD_MESSAGE}}".to_owned(),
+            ..TemplateValues::default()
+        };
+
+        let rendered = render_template("{{THROTTLED_MESSAGE}}", &values, LoginState::Throttled);
+
+        assert_eq!(rendered, "{{WRONG_PASSWORD_MESSAGE}}");
     }
 
     #[test]
@@ -1323,20 +1709,26 @@ mod tests {
             ..TemplateValues::default()
         };
 
-        let rendered = render_template("{{PAGE_TITLE}}", &text, false);
+        let rendered = render_template("{{PAGE_TITLE}}", &text, LoginState::Neutral);
 
         assert_eq!(rendered, "{{SUBMIT_BUTTON_TEXT}}");
     }
 
     #[test]
     fn template_without_known_markers_is_unchanged() {
-        let rendered = render_template("<p>{{UNKNOWN}}</p>", &TemplateValues::default(), false);
-        assert_eq!(rendered, "<p>{{UNKNOWN}}</p>");
+        for state in [
+            LoginState::Neutral,
+            LoginState::WrongPassword,
+            LoginState::Throttled,
+        ] {
+            let rendered = render_template("<p>{{UNKNOWN}}</p>", &TemplateValues::default(), state);
+            assert_eq!(rendered, "<p>{{UNKNOWN}}</p>");
+        }
     }
 
     #[test]
     fn renderer_leaves_an_empty_template_empty() {
-        let rendered = render_template("", &TemplateValues::default(), false);
+        let rendered = render_template("", &TemplateValues::default(), LoginState::Neutral);
         assert!(rendered.is_empty());
     }
 

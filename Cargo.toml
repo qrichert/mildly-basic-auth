@@ -34,6 +34,8 @@ cookie = { version = "0.18.1", features = ["percent-encode"] }
 form_urlencoded = "1.2.2"
 # IP network parsing and trusted-proxy CIDR membership.
 ipnet = "2.12.0"
+# Bound per-client login attempts without a background cleanup task.
+lru = { version = "0.18.2", default-features = false }
 # Async runtime.
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net"] }
 

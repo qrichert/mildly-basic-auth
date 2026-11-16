@@ -5,9 +5,11 @@
 //! wall. The gate reads only the `Cookie` *header* on the fast path, so
 //! streaming, `WebSockets`, and SSE are preserved.
 
+use std::net::SocketAddr;
+
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::{Request, State};
-use axum::http::header::{COOKIE, HOST, SET_COOKIE};
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::header::{CACHE_CONTROL, COOKIE, HOST, RETRY_AFTER, SET_COOKIE};
 use axum::http::request::Parts;
 use axum::http::uri::Authority;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -16,7 +18,9 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use blake3::Hash;
 use cookie::Cookie;
 
+use crate::client_ip::resolve_client_ip;
 use crate::config::Config;
+use crate::throttle::{ClientKey, LoginThrottle};
 
 /// Session cookie name. Deliberately not `password`/`wall`: those words
 /// trip iOS Safari's Intelligent Tracking Prevention, which silently
@@ -42,8 +46,9 @@ const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
 /// reattached untouched and streamed to the upstream; only the
 /// unauthenticated `POST` branch consumes the body, which never reaches
 /// the upstream.
-pub(crate) async fn gate(State(config): State<Config>, request: Request, next: Next) -> Response {
+pub(crate) async fn gate(State(state): State<GateState>, request: Request, next: Next) -> Response {
     let (mut parts, body) = request.into_parts();
+    let config = &state.config;
 
     let cookies = parse_cookies(&parts.headers);
     if authenticate(&cookies, config.sessions()) {
@@ -52,17 +57,26 @@ pub(crate) async fn gate(State(config): State<Config>, request: Request, next: N
     }
 
     if parts.method == Method::POST {
-        return handle_login(
-            &parts,
-            body,
-            config.sessions(),
-            config.wall(),
-            config.wrong_password_wall(),
-        )
-        .await;
+        return handle_login(&parts, body, &state).await;
     }
 
     wall_response(config.wall().clone())
+}
+
+/// Immutable configuration and one limiter shared by every gate clone.
+#[derive(Clone)]
+pub(crate) struct GateState {
+    config: Config,
+    throttle: LoginThrottle,
+}
+
+impl GateState {
+    /// Initialize the limiter once per application, not per request.
+    pub(crate) fn new(config: Config) -> Self {
+        let throttle =
+            LoginThrottle::new(config.login_throttle_rate(), config.login_throttle_burst());
+        Self { config, throttle }
+    }
 }
 
 /// Rewrite the outgoing headers of an authenticated request: strip our
@@ -84,27 +98,42 @@ fn sanitize_request_headers(parts: &mut Parts, cookies: &[CookiePair]) {
 /// attempt (e.g. a protected form submitted after its session expired), so
 /// it gets the neutral `wall` — not the failed-login state. The body is
 /// capped and never forwarded upstream.
-async fn handle_login(
-    parts: &Parts,
-    body: Body,
-    sessions: &[Hash],
-    wall: &Bytes,
-    wrong_password_wall: &Bytes,
-) -> Response {
+///
+/// Reserve before comparing the password: even a correct password must
+/// be rejected while throttled, or its response would reveal a match.
+async fn handle_login(parts: &Parts, body: Body, state: &GateState) -> Response {
     let Ok(bytes) = to_bytes(body, MAX_LOGIN_BODY).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
-    match extract_submitted_password(&bytes) {
+    let config = &state.config;
+    let Some(password) = extract_submitted_password(&bytes) else {
         // No `password` field: not a login attempt, so keep the neutral
         // wall instead of falsely showing the failed-login state.
-        None => wall_response(wall.clone()),
-        Some(password) => match matching_session(&password, sessions) {
-            // Hand `login_success` the digest that actually matched, so the
-            // cookie carries a token that authenticates on the follow-up.
-            Some(session) => login_success(parts, session),
-            // A password was submitted but matched nothing: failed login.
-            None => wall_response(wrong_password_wall.clone()),
-        },
+        return wall_response(config.wall().clone());
+    };
+
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|peer| peer.0);
+    let client = ClientKey::from(resolve_client_ip(
+        peer,
+        &parts.headers,
+        config.trusted_proxy_cidrs(),
+    ));
+    if let Err(retry_after) = state.throttle.reserve(client) {
+        return throttled_response(config.throttled_wall().clone(), retry_after);
+    }
+
+    match matching_session(&password, config.sessions()) {
+        // Hand `login_success` the digest that actually matched, so the
+        // cookie carries a token that authenticates on the follow-up.
+        Some(session) => {
+            state.throttle.clear(client);
+            login_success(parts, session)
+        }
+        // A password was submitted but matched nothing: failed login.
+        None => wall_response(config.wrong_password_wall().clone()),
     }
 }
 
@@ -125,6 +154,20 @@ fn login_success(parts: &Parts, session: &Hash) -> Response {
 /// native Basic-auth dialog — the very UX we're replacing).
 fn wall_response(wall: Bytes) -> Response {
     (StatusCode::UNAUTHORIZED, Html(wall)).into_response()
+}
+
+/// A rejected attempt was not checked; explain when it can be retried.
+/// Never cache the transient response or mint a session cookie.
+fn throttled_response(wall: Bytes, retry_after: u64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (RETRY_AFTER, retry_after.to_string()),
+            (CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        Html(wall),
+    )
+        .into_response()
 }
 
 /// A single parsed request cookie: decoded name/value for classification
@@ -295,6 +338,138 @@ fn build_set_cookie(session: &Hash, secure: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn login_throttle_missing_peer_shares_one_unknown_bucket() {
+        let state = login_throttle_state();
+        for (forwarded, expected) in [
+            ("192.0.2.1", StatusCode::UNAUTHORIZED),
+            ("192.0.2.2", StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            let (parts, body) = Request::builder()
+                .method(Method::POST)
+                .header(X_FORWARDED_FOR, forwarded)
+                .body(Body::from("password=wrong"))
+                .unwrap()
+                .into_parts();
+
+            assert_eq!(handle_login(&parts, body, &state).await.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn login_throttle_password_less_post_does_not_reserve() {
+        let state = login_throttle_state();
+        let (parts, body) = Request::builder()
+            .method(Method::POST)
+            .body(Body::from("comment=hello"))
+            .unwrap()
+            .into_parts();
+
+        assert_eq!(
+            handle_login(&parts, body, &state).await.status(),
+            StatusCode::UNAUTHORIZED,
+        );
+        assert_eq!(state.throttle.reserve(ClientKey::from(None)), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn login_throttle_oversized_post_does_not_reserve() {
+        let state = login_throttle_state();
+        let (parts, body) = Request::builder()
+            .method(Method::POST)
+            .body(Body::from(format!(
+                "password={}",
+                "x".repeat(MAX_LOGIN_BODY)
+            )))
+            .unwrap()
+            .into_parts();
+
+        assert_eq!(
+            handle_login(&parts, body, &state).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        );
+        assert_eq!(state.throttle.reserve(ClientKey::from(None)), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn login_throttle_empty_password_reserves_an_attempt() {
+        let state = login_throttle_state();
+        let (parts, body) = Request::builder()
+            .method(Method::POST)
+            .body(Body::from("password="))
+            .unwrap()
+            .into_parts();
+
+        assert_eq!(
+            handle_login(&parts, body, &state).await.status(),
+            StatusCode::UNAUTHORIZED,
+        );
+        assert!(state.throttle.reserve(ClientKey::from(None)).is_err());
+    }
+
+    #[tokio::test]
+    async fn login_throttle_non_post_requests_do_not_reserve() {
+        for method in [Method::GET, Method::PUT] {
+            let state = login_throttle_state();
+            let (base, client) = serve_login_throttle_gate(state.clone()).await;
+            let response = client
+                .request(method, &base)
+                .body("password=wrong")
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(state.throttle.reserve(ClientKey::from(None)), Ok(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn login_throttle_authenticated_request_bypasses_without_resetting() {
+        let state = login_throttle_state();
+        state.throttle.reserve(ClientKey::from(None)).unwrap();
+        let (base, client) = serve_login_throttle_gate(state.clone()).await;
+        // A valid session must keep its untouched body even when it is
+        // too large for the login path and that client's bucket is empty.
+        let body = format!("password={}", "x".repeat(MAX_LOGIN_BODY));
+        let response = client
+            .post(&base)
+            .header(COOKIE, format!("mba={}", token()))
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), body);
+        assert!(state.throttle.reserve(ClientKey::from(None)).is_err());
+    }
+
+    /// A single-attempt allowance whose refill cannot affect these tests.
+    fn login_throttle_state() -> GateState {
+        GateState {
+            config: Config::from_values("hunter2", "http://app:2001").unwrap(),
+            throttle: LoginThrottle::new(0.000_001, 1),
+        }
+    }
+
+    /// Exercise the middleware with an echo handler and no peer metadata.
+    async fn serve_login_throttle_gate(state: GateState) -> (String, reqwest::Client) {
+        let app = axum::Router::new()
+            .fallback(|request: Request| async move {
+                to_bytes(request.into_body(), usize::MAX).await.unwrap()
+            })
+            .layer(axum::middleware::from_fn_with_state(state, gate));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        (format!("http://{address}"), client)
+    }
 
     /// Digest of the password used across the cookie tests.
     fn session() -> Hash {

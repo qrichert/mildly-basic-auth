@@ -13,6 +13,7 @@
 mod client_ip;
 mod config;
 mod gate;
+mod throttle;
 
 pub use config::{Config, ConfigError};
 
@@ -27,16 +28,16 @@ use axum_reverse_proxy::{ReverseProxy, Rfc9110Layer};
 /// the WebSocket upgrade handshake. The gate is the outermost layer, so it
 /// decides passthrough-vs-wall before the proxy ever sees a request.
 ///
-/// For future IP-based features, serve this router using
+/// Serve this router using
 /// `into_make_service_with_connect_info::<std::net::SocketAddr>()` so
-/// requests carry the TCP peer address. The internal client-IP resolver
-/// returns an unknown identity when that metadata is absent. Current
-/// password and session authentication does not require it.
+/// login throttling can identify each client's TCP peer address. Without
+/// that metadata, all unauthenticated login attempts share the unknown-
+/// client allowance. Valid sessions bypass throttling in either case.
 pub fn build_app(config: Config) -> Router {
     // `config.upstream()` is borrowed only for this statement; `config`
     // is then moved into the gate's state below.
     let proxy: Router = ReverseProxy::new("/", config.upstream()).into();
     proxy
         .layer(Rfc9110Layer::new())
-        .layer(from_fn_with_state(config, gate::gate))
+        .layer(from_fn_with_state(gate::GateState::new(config), gate::gate))
 }
