@@ -10,6 +10,7 @@
 // gate.
 #![allow(clippy::multiple_crate_versions)]
 
+mod client_ip;
 mod config;
 mod gate;
 
@@ -25,6 +26,12 @@ use axum_reverse_proxy::{ReverseProxy, Rfc9110Layer};
 /// strips hop-by-hop headers (the base proxy does not) while preserving
 /// the WebSocket upgrade handshake. The gate is the outermost layer, so it
 /// decides passthrough-vs-wall before the proxy ever sees a request.
+///
+/// For future IP-based features, serve this router using
+/// `into_make_service_with_connect_info::<std::net::SocketAddr>()` so
+/// requests carry the TCP peer address. The internal client-IP resolver
+/// returns an unknown identity when that metadata is absent. Current
+/// password and session authentication does not require it.
 pub fn build_app(config: Config) -> Router {
     // `config.upstream()` is borrowed only for this statement; `config`
     // is then moved into the gate's state below.

@@ -9,6 +9,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use std::io::Write;
+use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use mildly_basic_auth::{Config, build_app};
@@ -48,7 +49,8 @@ async fn main() -> ExitCode {
         }
     }
 
-    if let Err(error) = axum::serve(listener, build_app(config)).await {
+    let app = build_app(config).into_make_service_with_connect_info::<SocketAddr>();
+    if let Err(error) = axum::serve(listener, app).await {
         eprintln!("error: server failed: {error}");
         return ExitCode::FAILURE;
     }

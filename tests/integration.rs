@@ -8,6 +8,7 @@
 // Transitive duplicate crate versions only (see `lib.rs`).
 #![allow(clippy::multiple_crate_versions)]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -105,7 +106,8 @@ async fn spawn_with_passwords(passwords: &[&str]) -> Harness {
     let config = Config::from_passwords(passwords, &format!("http://{up_addr}")).unwrap();
     let gate_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gate_addr = gate_listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(gate_listener, build_app(config)).await.unwrap() });
+    let app = build_app(config).into_make_service_with_connect_info::<SocketAddr>();
+    tokio::spawn(async move { axum::serve(gate_listener, app).await.unwrap() });
 
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -886,6 +888,49 @@ fn invalid_address_fails_fast() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("MBA_ADDRESS"), "stderr: {stderr}");
+}
+
+#[test]
+fn invalid_trusted_proxy_configuration_fails_before_binding() {
+    // Keep the port occupied so a missing validation step fails at bind
+    // instead of starting a server that never exits during this test.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let output = binary_without_mba_environment()
+        .env("MBA_ADDRESS", listener.local_addr().unwrap().to_string())
+        .env("MBA_PASSWORD", PASSWORD)
+        .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+        .env("MBA_TRUSTED_PROXY_IPS", "10.0.0.0/8,,127.0.0.1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("MBA_TRUSTED_PROXY_IPS"), "stderr: {stderr}");
+    assert!(stderr.contains("entry 2"), "stderr: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_trusted_proxy_configuration_fails_before_binding() {
+    use std::os::unix::ffi::OsStringExt;
+
+    // An occupied port bounds this test even if validation is skipped.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let output = binary_without_mba_environment()
+        .env("MBA_ADDRESS", listener.local_addr().unwrap().to_string())
+        .env("MBA_PASSWORD", PASSWORD)
+        .env("MBA_UPSTREAM", "http://127.0.0.1:9")
+        .env(
+            "MBA_TRUSTED_PROXY_IPS",
+            std::ffi::OsString::from_vec(vec![0xff]),
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("MBA_TRUSTED_PROXY_IPS"), "stderr: {stderr}");
+    assert!(stderr.contains("Unicode"), "stderr: {stderr}");
 }
 
 #[test]

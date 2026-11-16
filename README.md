@@ -194,10 +194,11 @@ authentication.
 
 ### General
 
-| Variable             | Required | Description                                           |
-| -------------------- | -------- | ----------------------------------------------------- |
-| `MBA_ADDRESS`        | no       | IP and port to bind. Defaults to `0.0.0.0:8000`.      |
-| `MBA_PASSWORD_<tag>` | no\*     | An additional password; `<tag>` is a free-form label. |
+| Variable                | Required | Description                                           |
+| ----------------------- | -------- | ----------------------------------------------------- |
+| `MBA_ADDRESS`           | no       | IP and port to bind. Defaults to `0.0.0.0:8000`.      |
+| `MBA_PASSWORD_<tag>`    | no\*     | An additional password; `<tag>` is a free-form label. |
+| `MBA_TRUSTED_PROXY_IPS` | no       | Comma-separated proxy IPs or CIDRs. Empty by default. |
 
 \* At least one password must be set — `MBA_PASSWORD` or any
 `MBA_PASSWORD_<tag>`; there is no privileged base variable. Passwords
@@ -207,6 +208,12 @@ sessions created with it.
 
 `MBA_ADDRESS` accepts a concrete IPv4 or bracketed IPv6 address, not a
 hostname, and the port must not be zero.
+
+`MBA_TRUSTED_PROXY_IPS` treats connections from the listed IPs or
+networks as proxies, accepting their `X-Forwarded-For` client addresses.
+This lets future login throttling and IP-based password bypass use the
+visitors' addresses behind a proxy. Leave it unset for now: those
+features are not active yet. Invalid values stop startup.
 
 A missing or empty required variable, a duplicate password, or an
 invalid `MBA_ADDRESS` is a hard startup error, not a silent passthrough
@@ -340,8 +347,7 @@ small. Planned next:
 - **Config beyond env vars:** an env file or a YAML config file (via
   `MBA_CONFIG_FILE` or discovery).
 - **More settings:** auth method, logging on/off, session lifetime.
-- **Authentication hardening:** optional failed-login throttling, once
-  trusted client-IP handling is configurable.
+- **Authentication hardening:** optional failed-login throttling.
 
 ### Non-goals
 

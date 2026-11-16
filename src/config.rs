@@ -7,12 +7,15 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use axum::body::Bytes;
 use axum::http::Uri;
 use blake3::Hash;
+use ipnet::IpNet;
+
+use crate::client_ip::normalize_ip;
 
 /// Embedded password-page template. Compiled into the binary so rendering
 /// has no runtime asset dependency.
@@ -70,6 +73,10 @@ const ENV_TEMPLATE_PASSWORD_PLACEHOLDER: &str = "MBA_TEMPLATE_PASSWORD_PLACEHOLD
 const ENV_TEMPLATE_WRONG_PASSWORD_MESSAGE: &str = "MBA_TEMPLATE_WRONG_PASSWORD_MESSAGE";
 /// Environment variable overriding the submit button's text.
 const ENV_TEMPLATE_SUBMIT_BUTTON_TEXT: &str = "MBA_TEMPLATE_SUBMIT_BUTTON_TEXT";
+/// Environment variable listing IP addresses and CIDRs allowed to supply
+/// client identity through `X-Forwarded-For`. Unset means no proxies are
+/// trusted; private addresses and loopback receive no implicit trust.
+const ENV_TRUSTED_PROXY_IPS: &str = "MBA_TRUSTED_PROXY_IPS";
 /// Environment variable holding the upstream URL (required, absolute
 /// `http(s)://host[:port]`).
 const ENV_UPSTREAM: &str = "MBA_UPSTREAM";
@@ -78,8 +85,8 @@ const ENV_UPSTREAM: &str = "MBA_UPSTREAM";
 ///
 /// Cloned per request by the gate middleware (`from_fn_with_state`
 /// requires the state to be `Clone`), which is why fields stay cheap to
-/// clone (`SocketAddr` is `Copy`; `Bytes` is reference-counted; `Vec<Hash>`
-/// and `String` each clone one small heap allocation per request).
+/// clone (`SocketAddr` is `Copy`; `Bytes` is reference-counted; each
+/// non-empty `Vec` and `String` clones one heap allocation per request).
 #[derive(Clone)]
 pub struct Config {
     /// Validated IP socket address the service listens on.
@@ -93,6 +100,9 @@ pub struct Config {
     /// below). This is not memory scrubbing — the plaintext still lives in
     /// the process environment.
     sessions: Vec<Hash>,
+    /// Normalized proxy networks allowed to supply forwarded identity.
+    /// Empty by default, requiring explicit trust configuration.
+    trusted_proxy_cidrs: Vec<IpNet>,
     /// Validated absolute `http(s)://host[:port]` upstream. Stored as a
     /// `String` (not `Uri`) because `ReverseProxy::new` takes one generic
     /// `S: Into<String>` for both arguments; a `&Uri` would not satisfy
@@ -116,8 +126,10 @@ impl Config {
     /// Returns [`ConfigError`] if `MBA_ADDRESS` is not a valid non-zero
     /// IP socket address, no `MBA_PASSWORD*` variable has a non-empty
     /// UTF-8 value, two of them share the same value, a custom template
-    /// file is unusable, a template override is not valid Unicode, or
-    /// `MBA_UPSTREAM` is not a valid absolute HTTP(S) URL.
+    /// file is unusable, a template override is not valid Unicode,
+    /// `MBA_TRUSTED_PROXY_IPS` is not a valid Unicode list of IP
+    /// addresses or CIDRs, or `MBA_UPSTREAM` is not a valid absolute
+    /// HTTP(S) URL.
     pub fn from_env() -> Result<Self, ConfigError> {
         let address = match std::env::var(ENV_ADDRESS) {
             Ok(address) => address,
@@ -135,13 +147,17 @@ impl Config {
         let template = custom_template.as_deref().unwrap_or(WALL_TEMPLATE);
         let template_values = TemplateValues::from_env(std::env::vars_os())?;
         let upstream = std::env::var(ENV_UPSTREAM).unwrap_or_default();
-        Self::from_passwords_address_template_and_values(
+        let trusted_proxy_cidrs =
+            parse_trusted_proxy_cidrs(std::env::var_os(ENV_TRUSTED_PROXY_IPS))?;
+        let mut config = Self::from_passwords_address_template_and_values(
             &passwords,
             &upstream,
             &address,
             template,
             &template_values,
-        )
+        )?;
+        config.trusted_proxy_cidrs = trusted_proxy_cidrs;
+        Ok(config)
     }
 
     /// Build and validate from explicit values (pure, env-free).
@@ -260,6 +276,7 @@ impl Config {
         Ok(Self {
             bind_address: address,
             sessions,
+            trusted_proxy_cidrs: Vec::new(),
             upstream,
             wall,
             wrong_password_wall,
@@ -270,6 +287,15 @@ impl Config {
     /// any of them.
     pub(crate) fn sessions(&self) -> &[Hash] {
         &self.sessions
+    }
+
+    /// Networks explicitly trusted to supply forwarded client identity.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Pending throttling and allowlist consumers.")
+    )]
+    pub(crate) fn trusted_proxy_cidrs(&self) -> &[IpNet] {
+        &self.trusted_proxy_cidrs
     }
 
     /// Validated upstream URL, ready for `ReverseProxy::new`.
@@ -295,11 +321,75 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("bind_address", &self.bind_address)
             .field("sessions", &"<redacted>")
+            .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .field("upstream", &self.upstream)
             .field("wall", &"<rendered HTML>")
             .field("wrong_password_wall", &"<rendered HTML>")
             .finish()
     }
+}
+
+/// Parse explicit proxy trust networks; unset or blank means no trust.
+///
+/// Accept comma-separated IPv4/IPv6 addresses and CIDRs, trimming
+/// surrounding whitespace. Exact addresses become `/32` or `/128`.
+/// Invalid or non-Unicode input and empty entries in a non-empty list
+/// fail startup; hostnames, ports, and scope IDs are not accepted.
+/// Duplicate and overlapping entries are harmless. `/0` is valid and
+/// trusts every address in that family.
+///
+/// Normalize IPv4-mapped exact addresses and networks entirely within
+/// `::ffff:0:0/96` to IPv4. Other IPv6 networks keep their family, so
+/// `::/0` does not implicitly trust IPv4 peers.
+///
+/// For example, `192.0.2.1,::ffff:192.0.2.123/120` becomes
+/// `192.0.2.1/32,192.0.2.0/24`. Other IPv6 networks retain their family.
+fn parse_trusted_proxy_cidrs(value: Option<OsString>) -> Result<Vec<IpNet>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| ConfigError::InvalidTrustedProxyIps {
+            reason: "must contain valid Unicode".to_owned(),
+        })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    value
+        .split(',')
+        .enumerate()
+        .map(|(index, entry)| {
+            let entry = entry.trim();
+            let invalid = |reason: &str| ConfigError::InvalidTrustedProxyIps {
+                reason: format!("entry {} {reason}: {entry:?}", index + 1),
+            };
+            if entry.is_empty() {
+                return Err(invalid("must not be empty"));
+            }
+            if let Ok(ip) = entry.parse::<IpAddr>() {
+                return Ok(IpNet::from(normalize_ip(ip)));
+            }
+            let network = entry
+                .parse::<IpNet>()
+                .map_err(|_| invalid("must be an IP address or CIDR without a port or scope ID"))?
+                .trunc();
+            if let IpNet::V6(ipv6) = network {
+                // Only networks inside `::ffff:0:0/96` represent IPv4.
+                // Wider IPv6 networks must not acquire IPv4 trust
+                // implicitly.
+                if ipv6.prefix_len() >= 96
+                    && let Some(ipv4) = ipv6.network().to_ipv4_mapped()
+                {
+                    // A validated prefix in `96..=128` becomes `0..=32`.
+                    return Ok(IpNet::new_assert(IpAddr::V4(ipv4), ipv6.prefix_len() - 96));
+                }
+            }
+            Ok(network)
+        })
+        .collect()
 }
 
 /// Configurable values substituted into the password-page template.
@@ -582,6 +672,9 @@ pub enum ConfigError {
     InvalidTemplateText { variable: String },
     /// `MBA_TEMPLATE_FILE` did not name a usable UTF-8 template.
     InvalidTemplateFile { path: PathBuf, reason: String },
+    /// The trusted-proxy list was non-Unicode or contained an invalid
+    /// address, CIDR, or empty entry.
+    InvalidTrustedProxyIps { reason: String },
     /// `MBA_UPSTREAM` was unset or empty.
     MissingUpstream,
     /// `MBA_UPSTREAM` was set but is not an absolute HTTP(S) URL.
@@ -613,6 +706,9 @@ impl fmt::Display for ConfigError {
                 "`{ENV_TEMPLATE_FILE}` is not a usable UTF-8 template ({reason}): \"{}\"",
                 path.display(),
             ),
+            Self::InvalidTrustedProxyIps { reason } => {
+                write!(f, "`{ENV_TRUSTED_PROXY_IPS}` {reason}")
+            }
             Self::MissingUpstream => write!(f, "`{ENV_UPSTREAM}` must be set"),
             Self::InvalidUpstream { value, reason } => write!(
                 f,
@@ -666,6 +762,220 @@ mod tests {
                 .map(|(name, value)| (OsString::from(name), OsString::from(value))),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn unset_trusted_proxy_cidrs_are_empty() {
+        assert_eq!(
+            parse_trusted_proxy_cidrs(None).unwrap(),
+            Vec::<IpNet>::new()
+        );
+    }
+
+    #[test]
+    fn empty_trusted_proxy_cidrs_are_empty() {
+        for value in ["", " \n\t"] {
+            assert_eq!(
+                parse_trusted_proxy_cidrs(Some(value.into())).unwrap(),
+                Vec::<IpNet>::new()
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_addresses_become_host_networks() {
+        let networks = parse_trusted_proxy_cidrs(Some("192.0.2.1, 2001:db8::1".into())).unwrap();
+
+        assert_eq!(
+            networks,
+            [
+                "192.0.2.1/32".parse().unwrap(),
+                "2001:db8::1/128".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_trim_surrounding_whitespace() {
+        let networks =
+            parse_trusted_proxy_cidrs(Some(" \t 192.0.2.0/24 , \n 2001:db8::/32 \t ".into()))
+                .unwrap();
+
+        assert_eq!(
+            networks,
+            [
+                "192.0.2.0/24".parse().unwrap(),
+                "2001:db8::/32".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_discard_host_bits() {
+        let networks =
+            parse_trusted_proxy_cidrs(Some("192.0.2.123/24,2001:db8::1234/32".into())).unwrap();
+
+        assert_eq!(
+            networks,
+            [
+                "192.0.2.0/24".parse().unwrap(),
+                "2001:db8::/32".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_accept_broad_ranges() {
+        let networks = parse_trusted_proxy_cidrs(Some("0.0.0.0/0,::/0".into())).unwrap();
+
+        assert_eq!(
+            networks,
+            ["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn mapped_trusted_proxy_addresses_become_ipv4_host_networks() {
+        let networks = parse_trusted_proxy_cidrs(Some("::ffff:192.0.2.1".into())).unwrap();
+
+        assert_eq!(networks, ["192.0.2.1/32".parse().unwrap()]);
+    }
+
+    #[test]
+    fn mapped_trusted_proxy_cidrs_become_ipv4_networks() {
+        let networks = parse_trusted_proxy_cidrs(Some(
+            "::ffff:192.0.2.123/120,::ffff:0:0/96,::ffff:192.0.2.1/128".into(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            networks,
+            [
+                "192.0.2.0/24".parse().unwrap(),
+                "0.0.0.0/0".parse().unwrap(),
+                "192.0.2.1/32".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_preserve_other_ipv6_networks() {
+        let networks =
+            parse_trusted_proxy_cidrs(Some("::ffff:192.0.2.1/95,::/0,::192.0.2.1".into())).unwrap();
+
+        assert_eq!(
+            networks,
+            [
+                "::fffe:0:0/95".parse().unwrap(),
+                "::/0".parse().unwrap(),
+                "::192.0.2.1/128".parse().unwrap()
+            ]
+        );
+        assert!(!networks[1].contains(&"192.0.2.1".parse::<std::net::IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_keep_duplicates_and_overlaps() {
+        let networks =
+            parse_trusted_proxy_cidrs(Some("192.0.2.0/24,192.0.2.0/24,192.0.2.1".into())).unwrap();
+
+        assert_eq!(
+            networks,
+            [
+                "192.0.2.0/24".parse().unwrap(),
+                "192.0.2.0/24".parse().unwrap(),
+                "192.0.2.1/32".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_reject_empty_entries() {
+        for (value, position) in [
+            (",192.0.2.1", 1),
+            ("192.0.2.1, ,198.51.100.1", 2),
+            ("192.0.2.1,", 2),
+        ] {
+            let error = parse_trusted_proxy_cidrs(Some(value.into())).unwrap_err();
+
+            assert_matches!(&error, ConfigError::InvalidTrustedProxyIps { reason }
+                if reason.contains(&format!("entry {position}")) && reason.contains("empty"));
+            assert!(error.to_string().contains(ENV_TRUSTED_PROXY_IPS));
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_reject_invalid_entries() {
+        for value in [
+            "192.0.2.1/33",
+            "2001:db8::1/129",
+            "192.0.2.1/-1",
+            "192.0.2.1/",
+            "localhost",
+            "192.0.2.1:8000",
+            "[2001:db8::1]:8000",
+            "[2001:db8::1]",
+            "fe80::1%eth0",
+            "192.0.2.1/24/32",
+        ] {
+            let error =
+                parse_trusted_proxy_cidrs(Some(format!("127.0.0.1,{value}").into())).unwrap_err();
+
+            assert_matches!(&error, ConfigError::InvalidTrustedProxyIps { reason }
+                if reason.contains("entry 2") && reason.contains(value));
+            assert!(error.to_string().contains(ENV_TRUSTED_PROXY_IPS));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_proxy_cidrs_reject_non_unicode_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = parse_trusted_proxy_cidrs(Some(OsString::from_vec(vec![0xff]))).unwrap_err();
+
+        assert_matches!(&error, ConfigError::InvalidTrustedProxyIps { reason }
+            if reason.contains("Unicode"));
+        assert!(error.to_string().contains(ENV_TRUSTED_PROXY_IPS));
+    }
+
+    #[test]
+    fn single_password_constructor_defaults_to_no_trusted_proxies() {
+        let config = Config::from_values("hunter2", "http://app:2001").unwrap();
+
+        assert_eq!(config.trusted_proxy_cidrs(), []);
+    }
+
+    #[test]
+    fn multiple_password_constructor_defaults_to_no_trusted_proxies() {
+        let config = Config::from_passwords(&["hunter2", "swordfish"], "http://app:2001").unwrap();
+
+        assert_eq!(config.trusted_proxy_cidrs(), []);
+    }
+
+    #[test]
+    fn debug_includes_trusted_proxy_networks() {
+        let mut config = Config::from_values("hunter2", "http://app:2001").unwrap();
+        config.trusted_proxy_cidrs =
+            parse_trusted_proxy_cidrs(Some("192.0.2.0/24,2001:db8::/32".into())).unwrap();
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("trusted_proxy_cidrs"));
+        assert!(debug.contains("192.0.2.0/24"));
+        assert!(debug.contains("2001:db8::/32"));
+    }
+
+    #[test]
+    fn debug_still_redacts_all_session_digests() {
+        let config = Config::from_passwords(&["hunter2", "swordfish"], "http://app:2001").unwrap();
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("<redacted>"));
+        for session in config.sessions() {
+            assert!(!debug.contains(&session.to_hex().to_string()));
+        }
     }
 
     #[test]

@@ -784,6 +784,7 @@ dependencies = [
  "blake3",
  "cookie",
  "form_urlencoded",
+ "ipnet",
  "reqwest",
  "tokio",
 ]
