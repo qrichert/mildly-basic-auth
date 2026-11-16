@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn empty_template_text_variable_overrides_the_default() {
         let text = template_values_from_vars(&[(ENV_TEMPLATE_PAGE_TITLE, "")]);
-        assert!(text.page_title.is_empty());
+        assert_eq!(text.page_title, "");
     }
 
     #[test]
