@@ -7,6 +7,9 @@ PREFIX := "/usr/local"
 clean:
     cargo clean
 
+demo:
+    MBA_PASSWORD=foo MBA_UPSTREAM=https://example.com just run
+
 alias r := run
 # Build and run program
 run *args:
