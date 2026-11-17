@@ -132,20 +132,19 @@
         width: 100%;
         min-width: 0;
         height: 2.75rem;
-        border: 1px solid transparent;
-        border-radius: calc(var(--radius) * 2.2);
-        background: var(--input);
-        background: color-mix(in oklab, var(--input) 50%, transparent);
+        border: 1px solid var(--input);
+        border-radius: calc(var(--radius) - 2px);
+        background: transparent;
         padding: 0.5rem 0.75rem;
         color: var(--foreground);
         font-size: 1rem;
         line-height: 1.5rem;
         outline: none;
+        box-shadow: 0 1px 2px rgb(0 0 0 / 5%);
         transition:
           color 150ms ease,
           box-shadow 150ms ease,
-          border-color 150ms ease,
-          background-color 150ms ease;
+          border-color 150ms ease;
       }
 
       .input::placeholder {
@@ -154,7 +153,7 @@
 
       .input:focus-visible {
         border-color: var(--ring);
-        box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring), transparent 70%);
+        box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring), transparent 50%);
       }
 
       /*
@@ -173,10 +172,6 @@
         pointer-events: none; /* Clicks fall through to the input. */
       }
 
-      /*
-        This rule follows neutral focus with equal specificity, so the
-        red border and ring remain while retyping.
-      */
       .input[aria-invalid="true"] {
         /*
           Reserve room so masked text can't slide under the icon. Scoped
@@ -185,12 +180,23 @@
         */
         padding-inline-end: 2.5rem;
         border-color: var(--destructive);
-        box-shadow: 0 0 0 3px
-          color-mix(in oklch, var(--destructive), transparent 80%);
       }
 
       .input[aria-invalid="true"] + .alert {
         display: block;
+      }
+
+      /*
+        Keep the invalid identity while retyping, instead of the neutral
+        focus ring taking over. Same 50%-transparent ring as the neutral
+        `.input:focus-visible`, for visual consistency. The ring is a
+        soft outline; the full-contrast signal is the opaque red border
+        (plus the alert icon), so the translucent ring is fine.
+      */
+      .input[aria-invalid="true"]:focus-visible {
+        border-color: var(--destructive);
+        box-shadow: 0 0 0 3px
+          color-mix(in oklch, var(--destructive), transparent 50%);
       }
 
       .button {
@@ -203,14 +209,15 @@
         justify-content: center;
         gap: 0.5rem;
         border: 1px solid transparent;
-        border-radius: calc(var(--radius) * 2.6);
+        border-radius: calc(var(--radius) - 2px);
         background: var(--primary);
         color: var(--primary-foreground);
-        padding: 0.5rem 0.75rem;
+        padding: 0.5rem 1rem;
         font-size: 0.875rem;
         font-weight: 500;
         line-height: 1.25rem;
         outline: none;
+        box-shadow: 0 1px 2px rgb(0 0 0 / 5%);
         -webkit-tap-highlight-color: transparent;
         transition:
           background-color 150ms ease,
@@ -220,12 +227,12 @@
       }
 
       .button:hover {
-        background: color-mix(in oklch, var(--primary), transparent 20%);
+        background: color-mix(in oklch, var(--primary), transparent 3%);
       }
 
       .button:focus-visible {
         border-color: var(--ring);
-        box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring), transparent 70%);
+        box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring), transparent 50%);
       }
 
       .sr-only {
@@ -262,9 +269,18 @@
           color-scheme: dark;
         }
 
-        .input[aria-invalid="true"] {
-          box-shadow: 0 0 0 3px
-            color-mix(in oklch, var(--destructive), transparent 60%);
+        .input {
+          background-color: var(--input);
+        }
+
+        @supports (color: color-mix(in lab, red, red)) {
+          .input {
+            background-color: color-mix(
+              in oklab,
+              var(--input) 30%,
+              transparent
+            );
+          }
         }
       }
     </style>
